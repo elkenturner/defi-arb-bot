@@ -590,6 +590,8 @@ def calculate_net_out(amount_in, pool_a, pool_b, ctx, settle="native"):
         "start": start_sym,
         "start_asset": start,
         "legs": legs,           # [(Pool, token_in, token_out)], for re-running the route on a fork
+        "pool_a": pool_a,
+        "pool_b": pool_b,
         "amount_in": amount_in,
         "start_units": start_units,
         "end_units": end_units,
@@ -602,6 +604,45 @@ def calculate_net_out(amount_in, pool_a, pool_b, ctx, settle="native"):
         "net_profit": (end_units - start_units) / 10**start_dec * price - gas_usd,
         "ok": ok,
     }
+
+
+# ---------------------------------------------------------------- trade size search
+
+SEARCH_SIZES = (100, 250, 500, 1000, 2500, 5000)   # USD, coarse grid tried for every searched route
+SEARCH_TOP_ROUTES = 3                               # how many of a token's best routes (at --amount) get searched
+SEARCH_REFINE_ROUNDS = 2                            # each round tries the geometric midpoints next to the best size
+
+
+def search_best_size(pool_a, pool_b, ctx, settle="native", sizes=SEARCH_SIZES, rounds=SEARCH_REFINE_ROUNDS):
+    """Net profit across trade sizes for one route: the coarse grid, then refined around the best size.
+
+    Small sizes are dominated by gas, big ones by price impact; the best is usually in between. Refinement only looks
+    between already-tried neighbours (never beyond the grid). Returns {"best": calculate_net_out result at the best
+    size (None if every size failed), "curve": {usd_size: net_profit or None}}.
+    """
+    tried = {}
+
+    def run(size):
+        size = round(size, 2)
+        if size not in tried:
+            tried[size] = calculate_net_out(size, pool_a, pool_b, ctx, settle)
+        return tried[size]
+
+    for size in sizes:
+        run(size)
+    for _ in range(rounds):
+        ok = [x for x in sorted(tried) if tried[x]["ok"]]
+        if not ok:
+            break
+        best = max(ok, key=lambda x: tried[x]["net_profit"])
+        ordered = sorted(tried)
+        i = ordered.index(best)
+        for j in (i - 1, i + 1):
+            if 0 <= j < len(ordered):
+                run((best * ordered[j]) ** 0.5)
+    ok = [r for r in tried.values() if r["ok"]]
+    best = max(ok, key=lambda r: r["net_profit"]) if ok else None
+    return {"best": best, "curve": {x: (tried[x]["net_profit"] if tried[x]["ok"] else None) for x in sorted(tried)}}
 
 
 # ---------------------------------------------------------------- gas
@@ -1161,6 +1202,7 @@ class ScanSettings:
     gas_overhead: int = GAS_OVERHEAD
     gas_per_swap: int = GAS_PER_SWAP
     priority_gwei: float = 0.001
+    size_search: bool = False       # also search the best trade size for the top routes (search_best_size)
 
 
 def evaluate_token(w3, token, settings, rpc_url=RPC_URL):
@@ -1211,6 +1253,12 @@ def evaluate_token(w3, token, settings, rpc_url=RPC_URL):
     report["failed_routes"] = sum(not r["ok"] for r in results)
     report["routes"] = sorted((r for r in results if r["ok"]), key=lambda r: r["net_profit"], reverse=True)
     report["status"] = ctx.verdict     # SAFE or PROXY_WARNING
+    if settings.size_search:
+        report["size_search"] = []
+        for r in report["routes"][:SEARCH_TOP_ROUTES]:
+            found = search_best_size(r["pool_a"], r["pool_b"], ctx, settings.settle)
+            found["route"], found["path"] = r["route"], r["path"]
+            report["size_search"].append(found)
     return report
 
 
@@ -1226,9 +1274,12 @@ def main():
     ap.add_argument("--gas-overhead", type=int, default=GAS_OVERHEAD, help="fixed gas units per arb tx")
     ap.add_argument("--gas-per-swap", type=int, default=GAS_PER_SWAP, help="gas units added per swap")
     ap.add_argument("--priority-gwei", type=float, default=0.001, help="tip per gas on top of the base fee")
+    ap.add_argument("--size-search", action="store_true",
+                    help=f"also search trade sizes ${', $'.join(map(str, SEARCH_SIZES))} (+ refinement) "
+                         f"for the top {SEARCH_TOP_ROUTES} routes")
     args = ap.parse_args()
     settings = ScanSettings(args.amount, args.settle, args.min_profit, args.min_liquidity, args.max_tax,
-                            args.gas_overhead, args.gas_per_swap, args.priority_gwei)
+                            args.gas_overhead, args.gas_per_swap, args.priority_gwei, args.size_search)
 
     w3 = Web3(Web3.HTTPProvider(RPC_URL, request_kwargs={"timeout": 30}))
     if not w3.is_connected():
@@ -1261,6 +1312,12 @@ def main():
               f"{pct(r['max_impact']):>9}{r['gas_usdc']:>8.4f}{r['net_profit']:>+12.4f}  {decision}")
     if report["failed_routes"]:
         print(f"\n({report['failed_routes']} route(s) skipped: a quote returned 0, e.g. not enough liquidity for this size)")
+    for found in report.get("size_search", []):
+        best = found["best"]
+        curve = "  ".join(f"${x:,.0f}:{'fail' if v is None else f'{v:+.3f}'}" for x, v in found["curve"].items())
+        head = "no size quoted" if best is None else f"best ${best['amount_in']:,.2f} -> net {best['net_profit']:+.4f}"
+        print(f"\nSize search {found['route']}: {head}"
+              f"{'  TRADE' if best and best['net_profit'] > args.min_profit else ''}\n  {curve}")
     print(f"\nRule: TRADE only if net profit > ${args.min_profit:.2f} (USD). "
           "Fees and price impact are inside the quotes; gas scales with swap count. No arb trade was sent.")
 

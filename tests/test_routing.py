@@ -118,3 +118,22 @@ def test_tax_token_on_two_bases_reports_tax(make_trap, check):
     ctx = check(make_trap("TAX2P", tax_bps=200, renounce=True, bases=(USDC, WETH)))
     assert ctx.verdict == "UNSAFE"
     assert abs(ctx.transfer_tax - 0.02) < 1e-6
+
+
+def test_size_search_finds_the_interior_optimum(w3, make_trap, check):
+    # 11% mispricing between two $60k pools: small trades are dominated by gas and fees per dollar of gap,
+    # big ones by price impact, so the best size sits inside the grid and refinement adds points around it.
+    token = make_trap("SIZE", renounce=True, bases=(USDC, WETH), token_side={WETH: 27_000})
+    ctx = check(token)
+    ctx.eth_usd = scanner.eth_usd_mid(w3)
+    ctx.gas = scanner.build_gas_model(w3, 0.001, ctx.eth_usd)
+    usdc_pool = next(p for p in ctx.pools if p.base == USDC)
+    weth_pool = next(p for p in ctx.pools if p.base == WETH)
+    found = scanner.search_best_size(usdc_pool, weth_pool, ctx)
+    curve, best = found["curve"], found["best"]
+    assert set(scanner.SEARCH_SIZES) <= set(curve) and len(curve) > len(scanner.SEARCH_SIZES)   # refined
+    assert best["net_profit"] == max(v for v in curve.values() if v is not None)
+    assert min(scanner.SEARCH_SIZES) < best["amount_in"] < max(scanner.SEARCH_SIZES)
+    assert best["net_profit"] > curve[500] and best["net_profit"] > curve[5000]
+    # the best size is a full route result, ready to re-run on the fork
+    assert best["path"] == "USDC > SIZE > WETH > USDC" and best["ok"] and best["legs"]

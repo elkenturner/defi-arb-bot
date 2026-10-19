@@ -256,6 +256,11 @@ def summarize(report, settings):
         "warnings": list(ctx.warnings), "routes_checked": len(routes) + report["failed_routes"],
         "pools": [asdict(p) for p in ctx.pools],     # qualifying pools, so gap_monitor.py can load them directly
         "best": None if best is None else {k: best[k] for k in ("route", "path", "hops", "net_profit", "gas_usdc")},
+        "size_search": [{"route": f["route"], "path": f["path"],
+                         "best_size": f["best"]["amount_in"] if f["best"] else None,
+                         "best_net": f["best"]["net_profit"] if f["best"] else None,
+                         "curve": {str(x): v for x, v in f["curve"].items()}}
+                        for f in report.get("size_search", [])] if "size_search" in report else None,
         "hits": [],
     }
 
@@ -266,15 +271,18 @@ def evaluate_one(w3, rpc_url, address, settings):
     try:
         report = scanner.evaluate_token(w3, address, settings, rpc_url)
         summary = summarize(report, settings)
-        for r in report["routes"]:
-            if r["net_profit"] <= settings.min_profit:
-                break   # routes are sorted best-first
+        candidates = [(r, False) for r in report["routes"] if r["net_profit"] > settings.min_profit]
+        candidates += [(f["best"], True) for f in report.get("size_search", [])
+                       if f["best"] and f["best"]["net_profit"] > settings.min_profit]
+        for r, sized in candidates:
             hit = {k: r[k] for k in ("route", "path", "hops", "start", "net_profit", "gas_usdc", "amount_in")}
             hit["min_profit"] = settings.min_profit
+            hit["size_search"] = sized       # True: found by the size search, re-run on the fork at that size
             hit["pools"] = [p.address for p, _, _ in r["legs"]]
             hit["fork_check"] = confirm_route_on_fork(w3, r, r["gas_usdc"], report["eth_usd"])
             summary["hits"].append(hit)
-            print(f"HIT {hit['path']} quoted ${hit['net_profit']:+.4f}, fork check {hit['fork_check']}")
+            print(f"HIT {hit['path']} ${hit['amount_in']:,.2f} quoted ${hit['net_profit']:+.4f}, "
+                  f"fork check {hit['fork_check']}")
     except Exception as e:
         summary = {"token": address, "symbol": None, "status": "ERROR", "reason_code": "ERROR",
                    "reason": f"{type(e).__name__}: {str(e)[:300]}", "hits": []}
@@ -582,10 +590,12 @@ def main():
     ap.add_argument("--min-profit", type=float, default=1.0)
     ap.add_argument("--min-liquidity", type=float, default=50_000)
     ap.add_argument("--max-tax", type=float, default=0.5)
+    ap.add_argument("--size-search", action="store_true",
+                    help="also search the best trade size for each token's top routes (scanner.search_best_size)")
     args = ap.parse_args()
 
     settings = ScanSettings(amount=args.amount, settle=args.settle, min_profit=args.min_profit,
-                            min_liquidity=args.min_liquidity, max_tax=args.max_tax)
+                            min_liquidity=args.min_liquidity, max_tax=args.max_tax, size_search=args.size_search)
     tokens = load_tokens(args)
     blacklist = Blacklist(args.blacklist)
     print(f"pipeline: {len(tokens)} tokens, {args.workers} worker(s), {len(blacklist.entries)} blacklisted, "

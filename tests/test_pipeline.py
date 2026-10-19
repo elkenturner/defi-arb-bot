@@ -186,6 +186,7 @@ def test_queue_processes_tokens_sequentially_and_leaves_fork_clean(w3, cast_of_t
     assert hit["fork_check"]["confirmed"]
     assert abs(hit["fork_check"]["realized_net_usd"] - hit["net_profit"]) < 0.01 * hit["net_profit"]
     assert by_token[scanner.cs(cast_of_tokens["CLEAN2"])]["hits"] == []
+    assert arb["size_search"] is None and not any(h["size_search"] for h in arb["hits"])   # off by default
     text = out.getvalue()
     assert text.count("PROFIT ROUTE") == len(arb["hits"]) and "CLEAN2" not in text
 
@@ -203,6 +204,27 @@ def test_queue_processes_tokens_sequentially_and_leaves_fork_clean(w3, cast_of_t
     skipped = [r for r in again if r["status"] == "BLACKLISTED"]
     assert [scanner.cs(r["token"]) for r in skipped] == [scanner.cs(cast_of_tokens["TAXB"])]
     assert len(again) == len(tokens)
+
+
+def test_size_search_hit_is_rerun_on_the_fork_at_its_size(w3, cast_of_tokens, tmp_path):
+    settings = scanner.ScanSettings(size_search=True)
+    out = io.StringIO()
+    [arb] = pipeline.run_cycle([("ARB", cast_of_tokens["ARB"])], settings, workers=1,
+                               blacklist=pipeline.Blacklist(tmp_path / "bl.json"), rpc_url=LOCAL_URL,
+                               log_root=tmp_path / "logs", out=out)
+    searched = arb["size_search"]
+    assert len(searched) == min(scanner.SEARCH_TOP_ROUTES, arb["routes_checked"])   # 2 pools -> only 2 routes
+    top = searched[0]
+    assert top["path"] == "USDC > ARB > WETH > USDC"
+    assert top["best_net"] == max(v for v in top["curve"].values() if v is not None)
+    sized = [h for h in arb["hits"] if h["size_search"]]
+    assert sized and sized[0]["amount_in"] == top["best_size"] and sized[0]["net_profit"] == top["best_net"]
+    check = sized[0]["fork_check"]
+    assert check["confirmed"] and abs(check["realized_net_usd"] - top["best_net"]) < 0.01 * top["best_net"]
+    # the best size beats the default $500 trade on this route
+    fixed = next(h for h in arb["hits"] if not h["size_search"] and h["route"] == sized[0]["route"])
+    assert top["best_net"] > fixed["net_profit"]
+    assert out.getvalue().count("PROFIT ROUTE") == len(arb["hits"])
 
 
 def test_parallel_workers_use_isolated_forks(tmp_path):
