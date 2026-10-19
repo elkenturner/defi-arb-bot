@@ -20,13 +20,42 @@ import argparse
 import os
 from dataclasses import dataclass, field
 from itertools import permutations
+from pathlib import Path
 from typing import Optional
+from urllib.parse import urlparse
 
+from dotenv import load_dotenv
 from eth_abi import encode
 from web3 import Web3
 from web3.exceptions import ContractLogicError
 
+# RPC_URL is the endpoint this scanner talks to (usually a local anvil fork). BASE_RPC_URL (pipeline.py, tests) is the
+# upstream that forks copy state from. Either may come from the gitignored .env and may carry an API key, so they are
+# only ever shown through redact_url() / scrub().
+load_dotenv(Path(__file__).resolve().parent / ".env")
 RPC_URL = os.getenv("RPC_URL", "https://mainnet.base.org")
+
+
+def redact_url(url):
+    """Scheme + host only: provider URLs carry the API key in the path or query."""
+    p = urlparse(str(url))
+    return f"{p.scheme}://{p.hostname}" if p.hostname else "<rpc>"
+
+
+def scrub(text, *urls):
+    """`text` with every given URL (and its key-bearing path/query on its own) replaced by its redacted form."""
+    text = str(text)
+    for url in urls:
+        if not url:
+            continue
+        p = urlparse(url)
+        text = text.replace(url.rstrip("/"), redact_url(url))
+        # the key on its own too (it can show up without the host): every long path segment and query value
+        pieces = p.path.split("/") + [kv.split("=", 1)[-1] for kv in p.query.split("&")] + [p.password or ""]
+        for piece in sorted(pieces, key=len, reverse=True):
+            if len(piece) >= 8:
+                text = text.replace(piece, "<redacted>")
+    return text
 
 
 def cs(addr):
@@ -1203,9 +1232,10 @@ def main():
 
     w3 = Web3(Web3.HTTPProvider(RPC_URL, request_kwargs={"timeout": 30}))
     if not w3.is_connected():
-        raise SystemExit(f"Could not connect to {RPC_URL}")
+        raise SystemExit(f"Could not connect to {redact_url(RPC_URL)}")
     mode = "LOCAL FORK" if is_local_rpc(RPC_URL) else "LIVE (read-only)"
-    print(f"Connected to {RPC_URL} [{mode}] | chain {w3.eth.chain_id} | block {w3.eth.block_number}")
+    shown = RPC_URL if is_local_rpc(RPC_URL) else redact_url(RPC_URL)
+    print(f"Connected to {shown} [{mode}] | chain {w3.eth.chain_id} | block {w3.eth.block_number}")
 
     try:
         report = evaluate_token(w3, args.token, settings, RPC_URL)

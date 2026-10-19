@@ -29,7 +29,6 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import redirect_stdout
 from itertools import permutations
 from pathlib import Path
-from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 from eth_abi import decode, encode
@@ -61,10 +60,7 @@ def rpc_url():
     return (url, True) if url else (PUBLIC_RPC, False)
 
 
-def redact(url):
-    """Scheme + host only: provider URLs carry the API key in the path or query."""
-    p = urlparse(url)
-    return f"{p.scheme}://{p.hostname}" if p.hostname else "<rpc>"
+redact = scanner.redact_url
 
 
 def latest_results(log_dir=LOG_DIR):

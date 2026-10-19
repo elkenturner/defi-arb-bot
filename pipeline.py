@@ -35,7 +35,7 @@ from scanner import MALICIOUS_CODES, USDC, WETH, ScanSettings, cs, erc20, send, 
 ROOT = Path(__file__).resolve().parent
 BLACKLIST_PATH = ROOT / "blacklist.json"
 LOG_DIR = ROOT / "logs"
-FORK_URL = os.getenv("BASE_RPC_URL", "https://mainnet.base.org")
+FORK_URL = os.getenv("BASE_RPC_URL", "https://mainnet.base.org")   # .env is loaded by `import scanner`; never print it raw
 BASE_PORT = 8600                 # worker i runs its anvil on BASE_PORT + i
 # Fork politely: free RPCs reset connections when anvil bursts parallel state fetches. Throttle + retry with backoff.
 ANVIL_FORK_FLAGS = ["--compute-units-per-second", "150", "--retries", "10", "--fork-retry-backoff", "1000",
@@ -283,6 +283,29 @@ def evaluate_one(w3, rpc_url, address, settings):
     return summary
 
 
+def scrub_deep(value, *urls):
+    """Every string inside a (nested) result with the given RPC URLs redacted, before it reaches a log or results.jsonl."""
+    if isinstance(value, str):
+        return scanner.scrub(value, *urls)
+    if isinstance(value, dict):
+        return {k: scrub_deep(v, *urls) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return type(value)(scrub_deep(v, *urls) for v in value)
+    return value
+
+
+class ScrubbingWriter:
+    """File wrapper that redacts RPC URLs from everything written to a per-token log."""
+    def __init__(self, f, *urls):
+        self.f, self.urls = f, urls
+
+    def write(self, text):
+        return self.f.write(scanner.scrub(text, *self.urls))
+
+    def flush(self):
+        self.f.flush()
+
+
 def _raise_exit(signum, frame):
     raise SystemExit(0)
 
@@ -320,9 +343,10 @@ def worker_main(worker_id, port, rpc_url, fork_url, tasks, results, settings, lo
                 w3.provider.make_request("anvil_reset", [{"forking": {"jsonRpcUrl": fork_url}}])
                 w3.provider.make_request("anvil_setBalance", [FORK_MARKER, marker])
             log_path = Path(log_dir) / f"{safe_name(symbol)}-{address[:10]}.log"
-            with open(log_path, "w") as log, redirect_stdout(log):
+            with open(log_path, "w") as log, redirect_stdout(ScrubbingWriter(log, fork_url)):
                 print(f"worker {worker_id} | {rpc_url} | {symbol} {address}")
                 summary = evaluate_one(w3, rpc_url, address, settings)
+            summary = scrub_deep(summary, fork_url)
             if own_fork and hex(w3.eth.get_balance(FORK_MARKER)) != marker:
                 raise RuntimeError("fork sentinel changed: another process is using this worker's fork")
             summary.update({"worker": worker_id, "rpc": rpc_url, "log": str(log_path), "fork_marker_ok": own_fork,
@@ -330,7 +354,8 @@ def worker_main(worker_id, port, rpc_url, fork_url, tasks, results, settings, lo
             results.put(summary)
             current = None
     except BaseException as e:
-        results.put({"worker_failed": worker_id, "token": current, "error": f"{type(e).__name__}: {e}"})
+        results.put({"worker_failed": worker_id, "token": current,
+                     "error": scanner.scrub(f"{type(e).__name__}: {e}", fork_url)})
     finally:
         stop_process(anvil)
 
@@ -436,6 +461,7 @@ def run_cycle(tokens, settings, workers=1, blacklist=None, rpc_url=None, fork_ur
     symbols = dict((a, s) for s, a in queue_items)
 
     def record(summary, results_log):
+        summary = scrub_deep(summary, fork_url)
         pending.discard(cs(summary["token"]))
         handle_result(summary, blacklist, out, results_log)
         summaries.append(summary)
@@ -563,7 +589,7 @@ def main():
     tokens = load_tokens(args)
     blacklist = Blacklist(args.blacklist)
     print(f"pipeline: {len(tokens)} tokens, {args.workers} worker(s), {len(blacklist.entries)} blacklisted, "
-          f"${args.amount:,.0f} trades, hit threshold ${args.min_profit:.2f}, upstream {args.fork_url}")
+          f"${args.amount:,.0f} trades, hit threshold ${args.min_profit:.2f}, upstream {scanner.redact_url(args.fork_url)}")
     cycle = 1
     try:
         while True:

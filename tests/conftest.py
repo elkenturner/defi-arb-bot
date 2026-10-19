@@ -15,7 +15,7 @@ sys.path.insert(0, str(ROOT))
 import scanner  # noqa: E402
 from scanner import AERO_FACTORY, AERO_FACTORY_ABI, AERO_ROUTER, USDC, WETH, Pool, erc20, send, swap_on_fork  # noqa: E402
 
-FORK_URL = os.getenv("BASE_RPC_URL", "https://mainnet.base.org")
+FORK_URL = os.getenv("BASE_RPC_URL", "https://mainnet.base.org")   # .env already loaded by `import scanner`
 PORT = int(os.getenv("TEST_ANVIL_PORT", "8546"))
 LOCAL_URL = f"http://127.0.0.1:{PORT}"
 CONTRACTS = Path(__file__).resolve().parent / "contracts"

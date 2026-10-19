@@ -230,3 +230,63 @@ def test_parallel_workers_use_isolated_forks(tmp_path):
     for rpc in rpc_of.values():
         port = int(rpc.rsplit(":", 1)[1])
         assert pipeline.port_is_free(port), f"anvil still listening on {port}"
+
+
+# ---------------------------------------------------------------- the upstream RPC key never leaks
+
+SECRET = "SECRETKEY9f3a"
+
+
+def test_scrub_redacts_provider_urls_in_error_text():
+    url = f"https://base-mainnet.g.alchemy.com/v2/{SECRET}"
+    err = f"HTTPError: 429 Client Error: Too Many Requests for url: {url}/ (key {SECRET})"
+    clean = scanner.scrub(err, url)
+    assert SECRET not in clean and "https://base-mainnet.g.alchemy.com" in clean
+    nested = pipeline.scrub_deep({"reason": err, "hits": [{"fork_check": {"error": err}}], "n": 3}, url)
+    assert SECRET not in json.dumps(nested) and nested["n"] == 3
+    assert SECRET not in scanner.scrub(f"https://x.quiknode.pro/{SECRET}/ failed", f"https://x.quiknode.pro/{SECRET}/")
+
+
+@pytest.fixture
+def secret_upstream():
+    """A forwarding proxy to the test fork whose URL carries a fake API key, like a private provider's."""
+    import threading
+    import urllib.request
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    class Forward(BaseHTTPRequestHandler):
+        def do_POST(self):
+            body = self.rfile.read(int(self.headers["Content-Length"]))
+            req = urllib.request.Request(LOCAL_URL, body, {"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=120) as r:
+                data = r.read()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def log_message(self, *a):
+            pass
+
+    Forward.protocol_version = "HTTP/1.1"          # keep-alive: anvil opens many parallel fetches
+    ThreadingHTTPServer.request_queue_size = 256
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Forward)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    yield f"http://127.0.0.1:{server.server_port}/v2/{SECRET}"
+    server.shutdown()
+
+
+def test_upstream_key_never_reaches_output_results_or_logs(w3, secret_upstream, tmp_path, capfd):
+    # One real cycle where the forks copy from an upstream whose URL holds a key: an unlisted proxy (DRV, read-only
+    # checks) and a non-token (ERROR path, exception text recorded). The key must appear nowhere we write.
+    out = io.StringIO()
+    tokens = [("DRV", DRV), ("EOA", EOA)]
+    results = pipeline.run_cycle(tokens, SETTINGS, workers=1, blacklist=pipeline.Blacklist(tmp_path / "bl.json"),
+                                 fork_url=secret_upstream, base_port=8680, log_root=tmp_path / "logs", out=out)
+    assert {r["status"] for r in results} == {"DYNAMIC_UNSAFE", "ERROR"}
+    written = [p.read_text() for p in (tmp_path / "logs").rglob("*") if p.is_file()]
+    assert any("results" in str(p) for p in (tmp_path / "logs").rglob("*.jsonl"))
+    captured = capfd.readouterr()
+    for text in [out.getvalue(), captured.out, captured.err, json.dumps(results, default=str), *written]:
+        assert SECRET not in text
