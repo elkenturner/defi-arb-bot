@@ -1,0 +1,12 @@
+.venv/
+.env
+__pycache__/
+.pytest_cache/
+tests/contracts/out/
+tests/contracts/cache/
+logs/
+blacklist.json
+blacklist.*.json
+.DS_Store
+*.db
+*.log
