@@ -201,7 +201,7 @@ def stop_process(proc):
 def fund_on_fork(w3, asset, amount, who):
     """Give `who` exactly `amount` of WETH (wrap ETH) or USDC (mint via Circle's masterMinter, impersonated).
     Fork only. Minting instead of swapping keeps every pool price untouched."""
-    w3.provider.make_request("anvil_setBalance", [who, hex(10**22)])
+    scanner.prepare_test_wallet(w3, who, 10**22)
     if asset == WETH:
         send(w3, erc20(w3, WETH).functions.deposit(), who, value=amount)
         return

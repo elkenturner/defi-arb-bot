@@ -18,6 +18,34 @@ focusing on long-tail token pairs where big mainnet MEV searchers are less activ
 | `univ3` | Uniswap V3 | factory `getPool(a,b,fee)` for fees 0.01/0.05/0.3/1% | QuoterV2 (fee tier) | SwapRouter02 |
 | `aero` | Aerodrome v2 "legacy" (vAMM/sAMM) | PoolFactory `getPool(a,b,stable)` | pool `getAmountOut` | Router (fee-on-transfer-safe) |
 | `cl` | Aerodrome **Slipstream** (concentrated liquidity) | each CL factory's `tickSpacings()` → `getPool(a,b,tickSpacing)` | **that factory's** QuoterV2 (tickSpacing) | **that factory's** SwapRouter |
+| `univ4` | Uniswap V4, **hookless pools only** | computed PoolIds for (fee, tickSpacing) = (100,1) (500,10) (3000,60) (10000,200), read via StateView | V4Quoter (next-block context) | Universal Router 2.0 + Permit2 |
+
+**Uniswap V4 rules** (addresses from Uniswap's v4 deployment list, cross-checked on-chain; `test_v4_deployment_is_linked`):
+| Contract | Address |
+|---|---|
+| PoolManager | `0x498581fF718922c3f8e6A244956aF099B2652b2b` |
+| StateView | `0xA3c0c9b65baD0b08107Aa264b0f3dB444b867A71` |
+| V4Quoter | `0x0d5e0F971ED27FBfF6c2837bf31316121532048D` |
+| Universal Router **2.0** | `0x6fF5693b99212Da76ad316178A184AB56D299b43` |
+| Permit2 | `0x000000000022D473030F116dDEE9F6B43aC78BA3` |
+- A V4 pool has no contract address: `Pool.address` holds its **PoolId** = `keccak256(abi.encode(currency0, currency1, fee, tickSpacing, hooks))`.
+- **Hooked pools are out of scope.** A hook runs arbitrary code on every swap. Discovery only computes hookless keys, so
+  hooked pools are never seen. A hooked key passed to `v4_pool_from_key` is logged `skipped: hooked`: never a safety
+  failure, never blacklisted. Custom fee / tick-spacing pools aren't found either (V4 allows any). Most Base memecoin and
+  Zora/Clanker V4 liquidity is hooked, so V4 coverage today mostly adds blue chips (cbBTC: 5 pools ≥ $50k on 2026-10-19).
+- **Native ETH is the WETH base.** For the WETH base both `WETH` and native ETH (`address(0)`) pools are looked up
+  (`Pool.native`). Routes and P/L only ever see WETH. The fork swap unwraps (`WETH.withdraw`) before paying native ETH,
+  and for native output TAKEs into the router and `WRAP_ETH`s it to the sender. A real executor pays the same ~wrap gas.
+- **Fees:** Base V4 pools charge a **protocol fee** on top of the LP fee (12 bits per direction in `slot0.protocolFee`).
+  `Pool.fee` = protocol + LP − protocol·LP/1e6 (worst direction). Quotes already include both. Read once at discovery.
+- **Router struct:** UR 2.0's `ExactInputSingleParams` = `(PoolKey, zeroForOne, uint128 amountIn, uint128 amountOutMinimum, bytes hookData)`.
+  UR 2.1.x adds `uint256 minHopPriceX36`: don't swap routers without changing `V4_SWAP_PARAMS`.
+- **Quotes:** `quoteExactInputSingle((PoolKey, zeroForOne, uint128 exactAmount, bytes hookData))` → `(amountOut, gasEstimate)`,
+  in next-block context, capped at `QUOTE_GAS`. The quoter itself reverts with `NotEnoughLiquidity` on a partial fill,
+  so a returned quote is a full fill (no sqrtPrice to check). Amounts ≥ 2¹²⁸ → 0.
+- **Depth (Rule 1) for V4:** the PoolManager holds every pool's tokens, so there are no per-pool balances. `v4_band_walk`
+  walks initialized ticks (StateView bitmap + liquidityNet) and counts only liquidity within 2× / 0.5× of the price.
+  That's stricter than V3's raw balances. `test_band_walk_matches_the_quoter` checks the math against real swaps.
 
 **Slipstream has three live factory generations** (`SLIPSTREAM_DEPLOYMENTS`), confirmed by Aerodrome's FactoryRegistry
 `0x5C3F18F06CC09CA1910767A34a20F771039E37C0` → `poolFactories()`:
@@ -38,12 +66,12 @@ Slipstream rules:
 - Ignore the multi-factory "MixedQuoter" contracts (encoding unverified) and the unregistered empty CL factories.
 - **If the registry adds a factory, `test_every_cl_factory_is_registered_and_linked` fails on purpose.** Add the new one.
 
-**Quote safety (Uniswap V3 and Slipstream):**
+**Quote safety (Uniswap V3, V4 and Slipstream):**
 - Every quote `eth_call` is capped at `QUOTE_GAS` = 10M. Thin or wide pools can need ~1M+. A quote that runs out of gas or
   reverts returns 0 ("no quote") and the route is skipped. It never crashes the scan.
 - **Partial-fill guard:** if a quote's final `sqrtPriceX96After` lands on `MIN_SQRT_RATIO`/`MAX_SQRT_RATIO`, the pool ran dry
   before taking all of `amount_in`, and the quoter silently returns a partial amount. Such quotes are rejected (0).
-- Concentrated-liquidity pools can't handle transfer-tax tokens (swaps revert), so a tax token there fails the fork sim.
+- Concentrated-liquidity pools (V3, V4, Slipstream) can't handle transfer-tax tokens (swaps revert), so a tax token there fails the fork sim.
 - **Slipstream quotes run in next-block context** (`call_next_block`: eth_call block override number+1, time+2s).
   Fee modules add a same-block surcharge after a pool trades (CL1-ts100 WETH/USDC: ~0.06% at `latest` vs 0.015% next block),
   and our tx can only land next block. Quoting at `latest` under-priced that pool by ~0.06% per leg. If an RPC rejects block
@@ -89,6 +117,9 @@ run the token's transfer code, so a trap on one pool (e.g. sells blocked into th
 real swap there. A token that treats its pools differently is a trap by design. Recorded taxes are the worst seen across pools.
 Wallet A = `w3.eth.accounts[0]`, wallet B = `w3.eth.accounts[1]`. A is funded by wrapping 0.1 ETH (then swapping it to
 USDC through the anchor if the test pool is USDC-based).
+**On Base every default anvil account has an EIP-7702 delegation** (code `0xef0100…`, set on mainnet by whoever uses
+the public test keys). `prepare_test_wallet` strips that code on the fork before any test wallet is funded, so the sim
+runs on plain wallets and ETH sent to them doesn't run foreign code. Never call it on a real controller (may be a Safe).
 - **a) Buy:** A swaps $20 of the base asset → token. Revert or 0 tokens received = HONEYPOT. Received vs quoted = `ctx.buy_tax`.
 - **b) Transfer:** A sends everything to B. Revert = HONEYPOT. `1 - received/sent` = `ctx.transfer_tax`.
 - **c) Sell:** B sells everything back to the base asset. Revert or 0 out = HONEYPOT. Received vs quoted = `ctx.sell_tax`.
@@ -206,6 +237,23 @@ After that, only `VERIFIED_TOKENS` (WETH, USDC) pass. **Any long-tail token must
   workers. Use 1–2 workers on the public endpoint, more only with a private RPC.
 - Commands: `python pipeline.py` (one cycle) · `--loop --interval 300` · `--workers 2` · `--recheck`.
 
+## Trade size search (`--size-search`, scanner and pipeline)
+- Off by default (default behaviour unchanged: one size, `--amount`). With the flag, the top `SEARCH_TOP_ROUTES` (3)
+  routes per token (ranked at `--amount`) are re-quoted at `SEARCH_SIZES` = $100/$250/$500/$1k/$2.5k/$5k, then refined
+  `SEARCH_REFINE_ROUNDS` (2) times at the geometric midpoints next to the best size. Never beyond the grid.
+- `search_best_size()` returns the full route result at the best size plus the whole size→net curve.
+  results.jsonl gets `size_search: [{route, path, best_size, best_net, curve}]` (null when off).
+- A best-size net > `--min-profit` becomes a hit with `size_search: true` and is re-run on the fork **at that size**.
+  Only a fork-confirmed one gets the banner, as before.
+
+## Private RPC (`BASE_RPC_URL`)
+- `BASE_RPC_URL` = the **upstream** that anvil forks copy from (pipeline, tests, gap monitor). `RPC_URL` = the endpoint the
+  scanner talks to (usually the local fork). They are separate on purpose. Both may come from `.env` (gitignored),
+  loaded by `import scanner`.
+- Provider URLs carry the API key. **Never print or store them raw:** `scanner.redact_url()` (scheme + host) for display,
+  `scanner.scrub()` / `pipeline.scrub_deep()` on every per-token log line, worker error and results.jsonl record.
+  `test_upstream_key_never_reaches_output_results_or_logs` runs a cycle through an upstream whose URL holds a fake key.
+
 ## Gap monitor (`gap_monitor.py`): is there money, block by block?
 The pipeline samples each token once per ~15-min cycle; gaps live for seconds. The monitor watches **every block**.
 - **Inputs:** SAFE / PROXY_WARNING tokens from the latest `logs/*/results.jsonl` (no safety re-checks), with their
@@ -231,6 +279,8 @@ The pipeline samples each token once per ~15-min cycle; gaps live for seconds. T
 - `BASE_RPC_URL` comes from `.env` (gitignored) and falls back to the public RPC. The URL is never printed or stored
   (only scheme + host).
 - Commands: `python gap_monitor.py --minutes 120` · `python gap_monitor.py --report`.
+- RPC budget: `python rpc_bench.py --workers N` runs one pipeline cycle through a local counting proxy and reports upstream
+  calls per method (providers bill per method). The upstream URL is never shown.
 
 ## Tests
 `pytest -v tests/` starts its own anvil fork on port 8546, so it doesn't clash with a fork on 8545. It compiles
@@ -238,10 +288,10 @@ The pipeline samples each token once per ~15-min cycle; gaps live for seconds. T
 (`make_trap(..., bases=(USDC,))`, or `(WETH,)` / `(USDC, WETH)` for multi-base):
 - `test_safety.py` (10): CLEAN (renounced), LOCKED (owner, powers disabled), TAX5, HONEY, MUTTAX, PAUSE, BLIST, MINT,
   real WETH, real cbBTC.
-- `test_routing.py` (11): leg building for all base/settle combos, USD→WETH sizing, gas scaling, anchor mid vs quote,
+- `test_routing.py` (12; incl. size search finds the interior optimum): leg building for all base/settle combos, USD→WETH sizing, gas scaling, anchor mid vs quote,
   WETH-only safe and tax tokens, a USDC↔WETH triangle checked against an independent x·y=k recomputation, a honeypot
   on the *shallower* of two pools (must be UNSAFE), and a tax token on two bases.
-- `test_pipeline.py` (22): blacklist persistence + corrupt-file recovery, which reason codes get blacklisted, silent vs
+- `test_pipeline.py` (25; incl. size-search hit re-run at its size, RPC key scrubbing, upstream-key leak cycle): blacklist persistence + corrupt-file recovery, which reason codes get blacklisted, silent vs
   loud output (incl. an unconfirmed hit staying silent), transport errors never counted as honeypot, bad addresses in the
   list, busy port refused, dead workers don't hang the coordinator (<60s), shared-fork worker refusal, a full
   single-worker cycle over 5 assets on the test fork (in order, exactly once each, blacklist written, mispriced ARB token
@@ -257,11 +307,14 @@ The pipeline samples each token once per ~15-min cycle; gaps live for seconds. T
   first and leaves others NULL; live Slipstream fee per block; RPC errors fail the block without switching modes;
   streak/bridged-span math; report counts incl. missed tail and unknowns; complete-coverage claim only when true;
   runs reported separately; RPC key never printed or stored.
+- `test_uniswap_v4.py` (10): deployment links, PoolId derivation, discovery for USDC + native ETH, hooked keys skipped,
+  band walk == quoter, quote == real swap both ways (ERC20 and native ETH via WETH), oversize quote → 0, cbBTC fork sim on
+  V4 pools + mixed routes, gap monitor V4 mid price.
 - `test_slipstream.py` (7): discovery for both bases plus pool→factory linkage, quote == real swap, oversize quote →
   0, CL routes mixed with legacy pools, registry ↔ deployments tripwire, shared-tick-spacing quoter routing,
   next-block quote context. The quote==swap test pins the swap's timestamp to the quote's (dynamic fees decay with time).
 The test deployer gets USDC by minting through Circle's masterMinter (impersonated on the fork), **not** by swapping.
-Swapping $600k through the anchor moved its price and broke later tests. Takes about 12 minutes. Needs Foundry and internet. **Add a test whenever a new trap type or route shape is handled.**
+Swapping $600k through the anchor moved its price and broke later tests. Takes about 23 minutes (95 tests). Needs Foundry and internet. **Add a test whenever a new trap type or route shape is handled.**
 
 ## Tech stack
 - **Python 3** + **web3.py**: scanning, quoting, simulation driver
@@ -288,6 +341,7 @@ plus `--priority-gwei` (default 0.001) instead, so fork and live gas estimates m
 ## Key Base addresses
 - WETH: `0x4200000000000000000000000000000000000006`
 - USDC: `0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913`
+- Uniswap V4: see the V4 table above
 - Uniswap V3 Factory: `0x33128a8fC17869897dcE68Ed026d694621f6FDfD`
 - Uniswap V3 QuoterV2: `0x3d4e44Eb1374240CE5F1B871ab261CD16335B76a`
 - Uniswap V3 SwapRouter02: `0x2626664c2603336E57B271c5C0b26F421741e481`
@@ -304,4 +358,4 @@ plus `--priority-gwei` (default 0.001) instead, so fork and live gas estimates m
 - Tests: `pytest -v tests/`
 - Pipeline: `python pipeline.py [--loop] [--workers N] [--tokens 0x..,0x..] [--recheck]`
 - Safety knobs: `--min-liquidity 50000` (per pool, USD), `--max-tax 0.5` (percent), `--priority-gwei 0.001`
-- Routing knobs: `--settle native|usdc`, `--gas-overhead 60000`, `--gas-per-swap 120000`
+- Routing knobs: `--settle native|usdc`, `--gas-overhead 60000`, `--gas-per-swap 120000`, `--size-search`

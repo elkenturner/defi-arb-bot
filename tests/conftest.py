@@ -71,7 +71,7 @@ def deployer(w3):
     would shift the anchor pool's price for every later test.
     """
     owner = w3.eth.accounts[2]
-    w3.provider.make_request("anvil_setBalance", [owner, hex(10**22)])
+    scanner.prepare_test_wallet(w3, owner, 10**22)
     send(w3, erc20(w3, WETH).functions.deposit(), owner, value=500 * 10**18)   # ~12 WETH per $30k WETH pool
     usdc = w3.eth.contract(address=USDC, abi=[
         scanner.fn("masterMinter", [], ["address"]),

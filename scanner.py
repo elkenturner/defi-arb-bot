@@ -70,6 +70,19 @@ UNI_V3_ROUTER = cs("0x2626664c2603336E57B271c5C0b26F421741e481")  # SwapRouter02
 AERO_FACTORY = cs("0x420DD381b31aEf6683db6B902084cB0FFECe40Da")
 AERO_ROUTER = cs("0xcF77a3Ba9A5CA399B7c97c74d54e5b1Beb874E43")
 GAS_ORACLE = cs("0x420000000000000000000000000000000000000F")
+MULTICALL3 = cs("0xcA11bde05977b3631167028862bE2a173976CA11")   # same address on every chain; code verified on Base
+
+# Uniswap V4 (singleton PoolManager; pools are PoolIds, not contracts). Addresses from Uniswap's v4 deployment list
+# (developers.uniswap.org/docs/protocols/v4/deployments, "Base: 8453") and checked on-chain (code present, every
+# poolManager() link points at the PoolManager): test_v4_deployment_is_linked re-checks the links on every run.
+# Router = Universal Router 2.0, the one the docs list as "Universal Router". Its V4 ExactInputSingleParams has no
+# minHopPriceX36 field (2.1.x routers add one), so don't swap in a newer router without changing V4_SWAP_PARAMS.
+UNI_V4_POOL_MANAGER = cs("0x498581fF718922c3f8e6A244956aF099B2652b2b")
+UNI_V4_STATE_VIEW = cs("0xA3c0c9b65baD0b08107Aa264b0f3dB444b867A71")
+UNI_V4_QUOTER = cs("0x0d5e0F971ED27FBfF6c2837bf31316121532048D")
+UNI_V4_POSITION_MANAGER = cs("0x7C5f5A4bBd8fD63184577525326123B519429bDc")
+UNI_V4_UNIVERSAL_ROUTER = cs("0x6fF5693b99212Da76ad316178A184AB56D299b43")
+PERMIT2 = cs("0x000000000022D473030F116dDEE9F6B43aC78BA3")
 
 # Aerodrome Slipstream (concentrated liquidity): the three live CL factories listed by Aerodrome's FactoryRegistry
 # (0x5C3F18F06CC09CA1910767A34a20F771039E37C0, poolFactories()), each with its own QuoterV2 and SwapRouter.
@@ -103,6 +116,10 @@ NEXT_BLOCK_SECONDS = 2   # Base block time
 ZERO = "0x0000000000000000000000000000000000000000"
 
 UNI_FEE_TIERS = [100, 500, 3000, 10000]  # in hundredths of a bip: 0.01%, 0.05%, 0.3%, 1%
+# Uniswap V4 hookless pools are found by computing PoolIds for these standard (lpFee, tickSpacing) pairs. Pools with
+# custom fees or tick spacings are not found (V4 allows any). Hooked pools are never computed, so never scanned.
+UNI_V4_FEE_SPACINGS = [(100, 1), (500, 10), (3000, 60), (10000, 200)]
+V4_DEPTH_BAND_TICKS = 6932   # liquidity depth for V4 counts only liquidity within 2x / 0.5x of the current price
 
 # Why a token got its verdict. MALICIOUS_CODES are properties of the token itself (safe to cache as "bad");
 # the rest are about the environment or market right now and must be re-checked next time.
@@ -266,6 +283,23 @@ AERO_ROUTER_ABI = [{
                {"name": "to", "type": "address"}, {"name": "deadline", "type": "uint256"}],
     "outputs": [],
 }]
+V4_STATE_VIEW_ABI = [fn("getSlot0", ["bytes32"], ["uint160", "int24", "uint24", "uint24"]),
+                     fn("getLiquidity", ["bytes32"], ["uint128"]),
+                     fn("getTickBitmap", ["bytes32", "int16"], ["uint256"]),
+                     fn("getTickLiquidity", ["bytes32", "int24"], ["uint128", "int128"]),
+                     fn("poolManager", [], ["address"])]
+V4_POOL_KEY = "(address,address,uint24,int24,address)"
+V4_QUOTE_SIG = f"quoteExactInputSingle(({V4_POOL_KEY},bool,uint128,bytes))"
+V4_QUOTE_PARAMS = f"({V4_POOL_KEY},bool,uint128,bytes)"          # (poolKey, zeroForOne, exactAmount, hookData)
+V4_SWAP_PARAMS = f"({V4_POOL_KEY},bool,uint128,uint128,bytes)"   # UR 2.0: (poolKey, zeroForOne, in, minOut, hookData)
+UR_V4_SWAP, UR_WRAP_ETH = 0x10, 0x0b                             # Universal Router commands
+UR_MSG_SENDER, UR_ADDRESS_THIS = cs("0x" + "0" * 39 + "1"), cs("0x" + "0" * 39 + "2")   # recipient placeholders
+UR_CONTRACT_BALANCE = 1 << 255                                   # "the router's whole balance"
+V4_SWAP_EXACT_IN_SINGLE, V4_SETTLE_ALL, V4_TAKE, V4_TAKE_ALL = 0x06, 0x0c, 0x0e, 0x0f   # v4-periphery Actions
+V4_OPEN_DELTA = 0                                                # TAKE amount 0 = everything we're owed
+UNIVERSAL_ROUTER_ABI = [fn("execute", ["bytes", "bytes[]", "uint256"], [], "payable")]
+PERMIT2_ABI = [fn("approve", ["address", "address", "uint160", "uint48"], [], "nonpayable")]
+WETH_WITHDRAW_ABI = [fn("withdraw", ["uint256"], [], "nonpayable")]
 GAS_ORACLE_ABI = [fn("getL1FeeUpperBound", ["uint256"], ["uint256"])]
 CL_FACTORY_ABI = [fn("getPool", ["address", "address", "int24"], ["address"]), fn("tickSpacings", [], ["int24[]"])]
 CL_POOL_ABI = [fn("liquidity", [], ["uint128"]), fn("fee", [], ["uint24"]), fn("factory", [], ["address"])]
@@ -299,9 +333,12 @@ class Pool:
     stable: bool = False
     liquidity_usd: float = 0.0
     base: str = USDC   # the base asset this pool pairs the token against (USDC or WETH)
-    tick_spacing: int = 0          # Slipstream only
+    tick_spacing: int = 0          # Slipstream and Uniswap V4
     quoter: str = ""               # Slipstream only: the quoter of this pool's factory generation
     router: str = ""               # Slipstream only: the router of this pool's factory generation
+    native: bool = False           # Uniswap V4 only: the pool trades native ETH, which we treat as the WETH base
+    # Uniswap V4: `address` holds the PoolId (bytes32 hex), the pool's unique key; uni_fee_tier holds the LP fee
+    # and `fee` the LP fee plus Base's protocol fee (worst direction).
 
 
 @dataclass
@@ -396,6 +433,64 @@ def find_pools(w3, token):
             pools.append(Pool(f"Aero {'sAMM' if stable else 'vAMM'} {fee * 100:.2f}% /{bsym}", "aero", addr, fee,
                               stable=stable, base=base))
         pools += find_slipstream_pools(w3, token, base)
+        pools += find_v4_pools(w3, token, base)
+    return pools
+
+
+def v4_currency(pool, asset):
+    """The V4 currency for an asset in this pool: native ETH (address 0) stands in for WETH in a native pool."""
+    return ZERO if (pool.native and asset == WETH) else asset
+
+
+def v4_pool_key(pool, token):
+    """(currency0, currency1, fee, tickSpacing, hooks) for a univ4 Pool. Only hookless pools are ever built."""
+    a, b = token, v4_currency(pool, pool.base)
+    c0, c1 = (a, b) if int(a, 16) < int(b, 16) else (b, a)
+    return (c0, c1, pool.uni_fee_tier, pool.tick_spacing, ZERO)
+
+
+def v4_pool_id(key):
+    return "0x" + Web3.keccak(encode(["address", "address", "uint24", "int24", "address"], list(key))).hex() \
+        .removeprefix("0x")
+
+
+def v4_total_fee(lp_fee, protocol_fee):
+    """Swap fee fraction for a V4 pool: LP fee plus the protocol fee (12 bits per direction, worst one taken), applied
+    the way the PoolManager does: protocol + lp - protocol * lp / 1e6. The quoter already charges both."""
+    proto = max(protocol_fee & 0xFFF, protocol_fee >> 12)
+    return (proto + lp_fee - proto * lp_fee / 1_000_000) / 1_000_000
+
+
+def v4_pool_from_key(w3, key, token, base, log=print):
+    """A univ4 Pool for a PoolKey, or None if it's hooked, uninitialized or has no in-range liquidity.
+    Hooked pools are out of scope (a hook can run any code on every swap): skipped here, never a safety failure."""
+    c0, c1, lp_fee, spacing, hooks = key
+    if cs(hooks) != ZERO:
+        log(f"  UniV4 {lp_fee / 10000:.2f}% ts{spacing} /{base_symbol(base)}: skipped: hooked ({hooks})")
+        return None
+    native = ZERO in (c0, c1)
+    pool_id = v4_pool_id(key)
+    view = w3.eth.contract(address=UNI_V4_STATE_VIEW, abi=V4_STATE_VIEW_ABI)
+    sqrt_p, _, protocol_fee, live_lp_fee = view.functions.getSlot0(pool_id).call()
+    if sqrt_p == 0 or view.functions.getLiquidity(pool_id).call() == 0:
+        return None
+    fee = v4_total_fee(live_lp_fee, protocol_fee)
+    label = f"UniV4 {lp_fee / 10000:.2f}%{' ETH' if native else ''} /{base_symbol(base)}"
+    return Pool(label, "univ4", pool_id, fee, uni_fee_tier=lp_fee, base=base, tick_spacing=spacing, native=native)
+
+
+def find_v4_pools(w3, token, base):
+    """Hookless Uniswap V4 pools for token/base at the standard fee/tickSpacing pairs, read through StateView.
+    The WETH base is looked up both as WETH and as native ETH (address 0): routes treat native ETH as WETH, and the
+    fork swap unwraps/wraps around a native pool (WETH.withdraw before, WETH.deposit after)."""
+    pools = []
+    currencies = [base, ZERO] if base == WETH else [base]
+    for currency in currencies:
+        a, b = (token, currency) if int(token, 16) < int(currency, 16) else (currency, token)
+        for lp_fee, spacing in UNI_V4_FEE_SPACINGS:
+            pool = v4_pool_from_key(w3, (a, b, lp_fee, spacing, ZERO), token, base)
+            if pool:
+                pools.append(pool)
     return pools
 
 
@@ -425,12 +520,89 @@ def pool_liquidity_usd(w3, pool, token, eth_usd):
     tokens held by the pool (including out-of-range liquidity), so treat it as an upper bound.
     """
     sym, dec = BASES[pool.base]
-    base_bal = erc20(w3, pool.base).functions.balanceOf(pool.address).call()
+    if pool.kind == "univ4":
+        base_bal, token_bal = v4_band_balances(w3, pool, token)
+    else:
+        base_bal = erc20(w3, pool.base).functions.balanceOf(pool.address).call()
+        token_bal = erc20(w3, token).functions.balanceOf(pool.address).call()
     base_side = base_bal / 10**dec * usd_price(pool.base, eth_usd)
-    token_bal = erc20(w3, token).functions.balanceOf(pool.address).call()
     tokens_per_usd = quote(w3, pool, pool.base, token, usd_to_base_units(1, pool.base, eth_usd))
     token_side = token_bal / tokens_per_usd if tokens_per_usd else 0.0
     return 2 * min(base_side, token_side)
+
+
+def multicall(w3, calls, block="latest", chunk=100):
+    """[(target, calldata)] -> [raw bytes or None], batched through Multicall3 aggregate3 eth_calls."""
+    out = []
+    for i in range(0, len(calls), chunk):
+        part = [(t, True, bytes.fromhex(d[2:])) for t, d in calls[i:i + chunk]]
+        data = "0x" + selector("aggregate3((address,bool,bytes)[])") + encode(["(address,bool,bytes)[]"], [part]).hex()
+        raw = w3.eth.call({"to": MULTICALL3, "data": data, "gas": 50_000_000}, block)
+        out += [ret if ok else None for ok, ret in w3.codec.decode(["(bool,bytes)[]"], bytes(raw))[0]]
+    return out
+
+
+def v4_band_walk(w3, pool, band_ticks=V4_DEPTH_BAND_TICKS):
+    """Walk a V4 pool's liquidity from the current price to +-band_ticks, through every initialized tick.
+
+    Returns {"up": (currency1 in, currency0 out), "down": (currency0 in, currency1 out)} in smallest units, before
+    fees: what a swap pushing the price to the top / bottom of the band would pay and receive. The "out" amounts are
+    the tokens the pool's liquidity actually holds in that band.
+    """
+    view = w3.eth.contract(address=UNI_V4_STATE_VIEW, abi=V4_STATE_VIEW_ABI)
+    pid, ts = pool.address, pool.tick_spacing
+    block = w3.eth.block_number
+    sqrt_x96, tick, _, _ = view.functions.getSlot0(pid).call(block_identifier=block)
+    liquidity = view.functions.getLiquidity(pid).call(block_identifier=block)
+    lo, hi = tick - band_ticks, tick + band_ticks
+    words = range((lo // ts) >> 8, ((hi // ts) >> 8) + 1)
+    bitmaps = multicall(w3, [(UNI_V4_STATE_VIEW, view.functions.getTickBitmap(pid, w)._encode_transaction_data())
+                             for w in words], block)
+    ticks = []
+    for w, raw in zip(words, bitmaps):
+        bits = int.from_bytes(bytes(raw), "big") if raw else 0
+        while bits:
+            bit = (bits & -bits).bit_length() - 1
+            bits &= bits - 1
+            t = ((w << 8) + bit) * ts
+            if lo <= t <= hi:
+                ticks.append(t)
+    nets = {}
+    for t, raw in zip(ticks, multicall(w3, [(UNI_V4_STATE_VIEW, view.functions.getTickLiquidity(
+            pid, t)._encode_transaction_data()) for t in ticks], block)):
+        nets[t] = w3.codec.decode(["uint128", "int128"], bytes(raw))[1] if raw else 0
+
+    def sqrt_at(t):
+        return 1.0001 ** (t / 2)
+
+    cur = sqrt_x96 / 2**96
+    in1 = out0 = 0.0
+    L, s = liquidity, cur                       # up: pay currency1, receive the currency0 held above the price
+    for t in sorted(x for x in ticks if x > tick) + [hi]:
+        nxt = sqrt_at(t)
+        in1 += max(L, 0) * (nxt - s)
+        out0 += max(L, 0) * (1 / s - 1 / nxt)
+        L, s = L + nets.get(t, 0), nxt
+    in0 = out1 = 0.0
+    L, s = liquidity, cur                       # down: pay currency0, receive the currency1 held below the price
+    for t in sorted((x for x in ticks if x <= tick), reverse=True) + [lo]:
+        nxt = sqrt_at(t)
+        in0 += max(L, 0) * (1 / nxt - 1 / s)
+        out1 += max(L, 0) * (s - nxt)
+        L, s = L - nets.get(t, 0), nxt
+    return {"up": (int(in1), int(out0)), "down": (int(in0), int(out1))}
+
+
+def v4_band_balances(w3, pool, token, band_ticks=V4_DEPTH_BAND_TICKS):
+    """(base, token) smallest units held by a V4 pool's liquidity within +-band_ticks of the current price.
+
+    The PoolManager is a singleton holding every pool's tokens, so there is no per-pool balance to read. Counting only
+    liquidity near the price (2x / 0.5x by default) makes this stricter than V3's raw balances.
+    """
+    walk = v4_band_walk(w3, pool, band_ticks)
+    held0, held1 = walk["up"][1], walk["down"][1]
+    token_is_0 = int(token, 16) < int(v4_currency(pool, pool.base), 16)
+    return (held1, held0) if token_is_0 else (held0, held1)
 
 
 def filter_pools_by_liquidity(w3, pools, token, min_liquidity_usd, eth_usd=None):
@@ -457,6 +629,12 @@ def quote_request(w3, pool, token_in, token_out, amount_in):
     elif pool.kind == "cl":
         fn_call = w3.eth.contract(address=pool.quoter, abi=CL_QUOTER_ABI).functions.quoteExactInputSingle(
             (token_in, token_out, amount_in, pool.tick_spacing, 0))
+    elif pool.kind == "univ4":
+        token = token_out if token_in == pool.base else token_in
+        key = v4_pool_key(pool, token)
+        zero_for_one = v4_currency(pool, token_in) == key[0]
+        data = "0x" + selector(V4_QUOTE_SIG) + encode([V4_QUOTE_PARAMS], [(key, zero_for_one, amount_in, b"")]).hex()
+        return UNI_V4_QUOTER, data
     else:
         fn_call = w3.eth.contract(address=pool.address, abi=AERO_POOL_ABI).functions.getAmountOut(amount_in, token_in)
     return fn_call.address, fn_call._encode_transaction_data()
@@ -464,6 +642,10 @@ def quote_request(w3, pool, token_in, token_out, amount_in):
 
 def decode_quote(w3, pool, raw):
     """Amount out from a quote's raw return data; 0 for a partial fill (the pool ran dry before taking all input)."""
+    if pool.kind == "univ4":
+        # (amountOut, gasEstimate). The V4 quoter itself reverts (NotEnoughLiquidity) when a swap would only partly
+        # fill, so a returned amount is always a full fill.
+        return w3.codec.decode(["uint256", "uint256"], bytes(raw))[0]
     if pool.kind in ("univ3", "cl"):
         amount_out, sqrt_after = w3.codec.decode(_QUOTE_OUT_TYPES, bytes(raw))[:2]
         if sqrt_after <= MIN_SQRT_RATIO + 1 or sqrt_after >= MAX_SQRT_RATIO - 1:
@@ -474,11 +656,11 @@ def decode_quote(w3, pool, raw):
 
 def quote(w3, pool, token_in, token_out, amount_in):
     """Exact output (smallest units) for swapping amount_in through one pool. Includes fee + price impact."""
-    if amount_in <= 0:
+    if amount_in <= 0 or (pool.kind == "univ4" and amount_in >= 2**128):
         return 0
     try:
         target, data = quote_request(w3, pool, token_in, token_out, amount_in)
-        if pool.kind == "cl":
+        if pool.kind in ("cl", "univ4"):
             raw = call_next_block(w3, target, data)
         elif pool.kind == "univ3":
             raw = w3.eth.call({"to": target, "data": data, "gas": QUOTE_GAS})
@@ -690,6 +872,17 @@ def erc20(w3, addr):
     return w3.eth.contract(address=addr, abi=ERC20_ABI)
 
 
+def prepare_test_wallet(w3, who, wei=10**20):
+    """Fork only: give one of anvil's default accounts gas money and strip any code from it.
+
+    The default anvil keys are public, and on Base every one of them carries an EIP-7702 delegation (code 0xef0100..)
+    set by someone on mainnet. Left in place, ETH sent to the wallet runs that foreign code, and tokens that treat
+    contracts differently from plain wallets would be judged on the wrong kind of wallet. Never use this on a real
+    controller (it may be a Safe)."""
+    w3.provider.make_request("anvil_setCode", [who, "0x"])
+    w3.provider.make_request("anvil_setBalance", [who, hex(wei)])
+
+
 def send(w3, call, sender, value=0):
     """Send a local test transaction on the fork. Raises if it reverts."""
     tx_hash = call.transact({"from": sender, "value": value})
@@ -706,6 +899,8 @@ def swap_on_fork(w3, pool, token_in, token_out, amount_in, sender):
         router = w3.eth.contract(address=UNI_V3_ROUTER, abi=UNI_ROUTER_ABI)
         send(w3, router.functions.exactInputSingle(
             (token_in, token_out, pool.uni_fee_tier, sender, amount_in, 0, 0)), sender)
+    elif pool.kind == "univ4":
+        swap_v4_on_fork(w3, pool, token_in, token_out, amount_in, sender)
     elif pool.kind == "cl":
         send(w3, erc20(w3, token_in).functions.approve(pool.router, amount_in), sender)
         router = w3.eth.contract(address=pool.router, abi=CL_ROUTER_ABI)
@@ -718,6 +913,42 @@ def swap_on_fork(w3, pool, token_in, token_out, amount_in, sender):
         deadline = w3.eth.get_block("latest").timestamp + 600
         send(w3, router.functions.swapExactTokensForTokensSupportingFeeOnTransferTokens(
             amount_in, 0, [(token_in, token_out, pool.stable, AERO_FACTORY)], sender, deadline), sender)
+
+
+def swap_v4_on_fork(w3, pool, token_in, token_out, amount_in, sender):
+    """Exact-input swap on a hookless V4 pool through the Universal Router: V4_SWAP with SWAP_EXACT_IN_SINGLE,
+    SETTLE_ALL (pay the input via Permit2, or with msg.value for native ETH), TAKE_ALL (receive the output).
+    Native ETH pools: the WETH input is unwrapped first, and native ETH received is wrapped back, so callers only
+    ever see WETH. Like every fork swap, the sender must already hold token_in."""
+    token = token_out if token_in == pool.base else token_in
+    key = v4_pool_key(pool, token)
+    c_in, c_out = v4_currency(pool, token_in), v4_currency(pool, token_out)
+    value = 0
+    if c_in == ZERO:
+        send(w3, w3.eth.contract(address=WETH, abi=WETH_WITHDRAW_ABI).functions.withdraw(amount_in), sender)
+        value = amount_in
+    else:
+        send(w3, erc20(w3, token_in).functions.approve(PERMIT2, amount_in), sender)
+        permit2 = w3.eth.contract(address=PERMIT2, abi=PERMIT2_ABI)
+        expiry = w3.eth.get_block("latest").timestamp + 600
+        send(w3, permit2.functions.approve(token_in, UNI_V4_UNIVERSAL_ROUTER, amount_in, expiry), sender)
+    swap = encode([V4_SWAP_PARAMS], [(key, c_in == key[0], amount_in, 0, b"")])
+    settle = encode(["address", "uint256"], [c_in, amount_in])
+    commands = [UR_V4_SWAP]
+    if c_out == ZERO:
+        # native ETH out: TAKE it into the router, then WRAP_ETH the router's whole balance to the sender as WETH
+        actions = bytes([V4_SWAP_EXACT_IN_SINGLE, V4_SETTLE_ALL, V4_TAKE])
+        take = encode(["address", "address", "uint256"], [ZERO, UR_ADDRESS_THIS, V4_OPEN_DELTA])
+        inputs = [encode(["bytes", "bytes[]"], [actions, [swap, settle, take]]),
+                  encode(["address", "uint256"], [UR_MSG_SENDER, UR_CONTRACT_BALANCE])]
+        commands.append(UR_WRAP_ETH)
+    else:
+        actions = bytes([V4_SWAP_EXACT_IN_SINGLE, V4_SETTLE_ALL, V4_TAKE_ALL])
+        take = encode(["address", "uint256"], [c_out, 0])
+        inputs = [encode(["bytes", "bytes[]"], [actions, [swap, settle, take]])]
+    router = w3.eth.contract(address=UNI_V4_UNIVERSAL_ROUTER, abi=UNIVERSAL_ROUTER_ABI)
+    deadline = w3.eth.get_block("latest").timestamp + 600
+    send(w3, router.functions.execute(bytes(commands), inputs, deadline), sender, value=value)
 
 
 def is_onchain_revert(err):
@@ -781,8 +1012,8 @@ def run_fork_simulation(token, ctx, quiet=False, test_pool=None):
     snapshot = w3.provider.make_request("evm_snapshot", [])["result"]
     try:
         # Fund alice with the test pool's base: wrap ETH -> WETH (-> USDC through the anchor if needed).
-        w3.provider.make_request("anvil_setBalance", [alice, hex(10**20)])
-        w3.provider.make_request("anvil_setBalance", [bob, hex(10**20)])
+        prepare_test_wallet(w3, alice)
+        prepare_test_wallet(w3, bob)
         send(w3, erc20(w3, WETH).functions.deposit(), alice, value=SIM_WRAP_ETH)
         if base == USDC:
             swap_on_fork(w3, anchor_pool(w3), WETH, USDC, SIM_WRAP_ETH, alice)
@@ -821,8 +1052,8 @@ def run_fork_simulation(token, ctx, quiet=False, test_pool=None):
         try:
             swap_on_fork(w3, test_pool, token, base, received, bob)
         except Exception as e:
-            note = (" Concentrated-liquidity pools (Uniswap V3, Slipstream) also revert on any transfer-tax token."
-                    if test_pool.kind in ("univ3", "cl") else "")
+            note = (" Concentrated-liquidity pools (Uniswap V3/V4, Slipstream) also revert on any transfer-tax token."
+                    if test_pool.kind in ("univ3", "univ4", "cl") else "")
             failed = _sim_failure("HONEYPOT: sell reverted", e)
             return failed[0], failed[1] + note
         sold_for = base_tok.functions.balanceOf(bob).call() - u0
@@ -1229,7 +1460,7 @@ def evaluate_token(w3, token, settings, rpc_url=RPC_URL):
     bases = "/".join(base_symbol(b) for b in BASES if b != token)
     print(f"\n{sym} pools vs {bases}, per-pool liquidity (floor ${settings.min_liquidity:,.0f} each):")
     pools = filter_pools_by_liquidity(w3, all_pools, token, settings.min_liquidity, eth_usd)
-    venues = {"univ3": "Uniswap V3", "aero": "Aero legacy", "cl": "Aero Slipstream"}
+    venues = {"univ3": "Uniswap V3", "univ4": "Uniswap V4", "aero": "Aero legacy", "cl": "Aero Slipstream"}
     print("  Qualifying pools by venue: " + ", ".join(
         f"{name} {sum(p.kind == k for p in pools)}/{sum(p.kind == k for p in all_pools)}" for k, name in venues.items()))
 

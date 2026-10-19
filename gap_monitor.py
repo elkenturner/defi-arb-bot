@@ -174,6 +174,9 @@ GET_RESERVES = "0x" + scanner.selector("getReserves()")
 
 
 def mid_request(pool):
+    if pool.kind == "univ4":     # singleton: the pool's slot0 lives in the PoolManager, read through StateView
+        view = Web3().eth.contract(address=scanner.UNI_V4_STATE_VIEW, abi=scanner.V4_STATE_VIEW_ABI)
+        return (scanner.UNI_V4_STATE_VIEW, view.functions.getSlot0(pool.address)._encode_transaction_data())
     return (pool.address, SLOT0 if pool.kind in ("univ3", "cl") else GET_RESERVES)
 
 
@@ -187,8 +190,9 @@ def mid_price(pool, raw, token, token_dec):
     if raw is None:
         return None
     base_dec = BASES[pool.base][1]
-    token_is_0 = int(token, 16) < int(pool.base, 16)          # pools sort their two tokens by address
-    if pool.kind in ("univ3", "cl"):
+    base_currency = scanner.v4_currency(pool, pool.base) if pool.kind == "univ4" else pool.base   # native ETH = 0x0
+    token_is_0 = int(token, 16) < int(base_currency, 16)      # pools sort their two tokens by address
+    if pool.kind in ("univ3", "cl", "univ4"):
         sqrt_p = int.from_bytes(bytes(raw)[:32], "big")
         if sqrt_p == 0:
             return None

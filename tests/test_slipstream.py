@@ -27,7 +27,7 @@ def test_slipstream_quote_matches_real_swap(w3):
     alice = w3.eth.accounts[5]
     snap = w3.provider.make_request("evm_snapshot", [])["result"]
     try:
-        w3.provider.make_request("anvil_setBalance", [alice, hex(10**20)])
+        scanner.prepare_test_wallet(w3, alice)
         scanner.send(w3, scanner.erc20(w3, WETH).functions.deposit(), alice, value=10**17)
         scanner.send(w3, scanner.erc20(w3, WETH).functions.approve(pool.router, 10**17), alice)
         # Quote in next-block context (number+1, time+2s), then mine the swap exactly there, so time-based
