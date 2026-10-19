@@ -48,7 +48,8 @@ class CountingProxy:
                     proxy.requests += 1
                     proxy.batches += isinstance(msg, list)
                     proxy.methods.update(c.get("method", "?") for c in calls)
-                req = urllib.request.Request(proxy.upstream, body, {"Content-Type": "application/json"})
+                req = urllib.request.Request(proxy.upstream, body, {"Content-Type": "application/json",
+                                                                     "User-Agent": "defi-arb-bot/rpc_bench"})
                 try:
                     with urllib.request.urlopen(req, timeout=120) as r:
                         status, data = r.status, r.read()
@@ -95,7 +96,8 @@ def main():
     t0 = time.time()
     try:
         results = pipeline.run_cycle(tokens, scanner.ScanSettings(size_search=args.size_search), args.workers,
-                                     pipeline.Blacklist(bl_copy), fork_url=proxy.url, base_port=8720)
+                                     pipeline.Blacklist(bl_copy), fork_url=proxy.url, base_port=8720,
+                                     log_root=ROOT / "logs" / "rpc_bench")   # never the gap monitor's "latest run"
     finally:
         proxy.close()
     seconds = time.time() - t0

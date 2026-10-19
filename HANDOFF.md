@@ -75,8 +75,7 @@ seconds. The machinery works. Whether there's money in it is still unproven.
 | `blacklist.json` | Proven-bad tokens (5 entries now) | local cache, gitignored |
 | `requirements.txt` | web3, python-dotenv, pytest | |
 
-**⚠️ Not under version control.** There's no git repo yet, so nothing is backed up or undoable. That's the first
-recommended step (§9).
+**Version control:** local git repo since 2026-10-19 (no remote). `business/` is untracked (not part of the bot).
 
 **Tech stack:** Python 3.9 + web3.py; Foundry (`anvil` for forks, `forge` to compile test contracts) installed at
 `~/.foundry/bin`; public RPC `https://mainnet.base.org` (rate-limited; a private RPC is recommended before scaling).
@@ -206,17 +205,36 @@ venues not yet covered (Uniswap V4), at different trade sizes, or on newer/small
 
 ---
 
+**Session 2026-10-19 (git, size search, Uniswap V4, private-RPC wiring):**
+- **Uniswap V4 (hookless pools)** is now a fourth venue. Only **cbBTC** gains pools above the $50k floor (5 new: $2.7M
+  USDC 0.05%, $986k native-ETH 0.05%, …; 21 qualifying pools now). Every other seed token's hookless V4 pools are tiny.
+  ZORA/Clanker/memecoin V4 liquidity sits in **hooked** pools, which are out of scope, so V4 did not rescue ZORA.
+- **Size search, full cycle (2 workers):** no hits. For every route, the best size was **$100, the smallest tried**:
+  losses scale with size, i.e. the routes lose to fees, not to gas or impact. Same picture as before, from a new angle.
+  Best $100 nets: wstETH −$0.01, cbBTC / VIRTUAL −$0.02.
+- **Found and fixed:** every default anvil test wallet has an **EIP-7702 delegation on Base** (someone attached code to
+  the public test keys). The safety sim now strips it on the fork first (`prepare_test_wallet`).
+- **RPC cost of one 30-token cycle** (`rpc_bench.py`, public RPC, size search on):
+  | workers | time | upstream calls | 429 rate-limited | 401 |
+  |---|---|---|---|---|
+  | 2 | 27.5 min | 21,553 | 586 | 316 |
+  | 4 | 19.6 min | 23,001 | 1,812 | 338 |
+  ~72% of calls are `eth_getStorageAt` (anvil copying state). Roughly **22k calls per cycle**: every 15 min 24/7 that's
+  ~2.1M calls/day, which needs a paid plan. One cycle per hour is ~530k/day. More workers buy speed, not fewer calls, and on
+  the public RPC 4 workers get throttled 3× as often.
+- Between the two benchmark runs (30 min apart), cbETH's main Slipstream pool fell from $216k to $23k (an LP left), so
+  cbETH went THIN. Pool depth on long-tail venues really does change by the hour.
+
 ## 7. Known gaps and limitations
 
-- **Uniswap V4 isn't covered.** ZORA's liquidity is mostly on V4 (it reads THIN today). cbETH and weETH may also have
-  V4 pools (not yet measured). Uniswap V2 isn't covered either (KEYCAT's main pool), and no step below adds it.
-- **Fixed trade size.** Every route is tested at one size ($500). The best size per route isn't searched.
+- **Uniswap V4: hookless pools at the 4 standard fee/tick pairs only.** Hooked pools (most V4 memecoin/Zora/Clanker
+  liquidity) and custom-fee pools aren't scanned. Uniswap V2 isn't covered either (KEYCAT's main pool).
+- **Size search never goes below $100 or above $5,000.**
 - **Only scans when run.** No history of "near misses" or of how spreads behave over time yet.
 - **Public RPC** throttles. Keep 1–2 workers; more needs a private RPC (`BASE_RPC_URL`).
 - **Safety blind spots** (documented in `CLAUDE.md`): risky functions with unusual names; role-based admins
   (AccessControl, `minter()`); timelock roles for weETH; wallet-size/cooldown rules not tested.
 - **No execution contract, flash loan, or private transaction submission.** By design, not built yet.
-- **No git repo** (see §9, step 1).
 - **Speed:** a 30-token cycle takes ~15 min; the test suite ~12 min.
 
 ---
@@ -240,7 +258,7 @@ venues not yet covered (Uniswap V4), at different trade sizes, or on newer/small
 
 Ordered by value / risk. Each prompt is self-contained. Paste one at a time into Claude Code inside `~/defi-arb-bot`.
 
-### Step 1: Put the project under version control (5 min, do first)
+### Step 1: DONE (2026-10-19): git repo, first commit, no remote
 ```
 Initialize a git repository in ~/defi-arb-bot. Before the first commit, scan every file for private keys, API
 keys or RPC URLs with keys in them, and confirm .gitignore excludes .venv, logs/, blacklist*.json, .env and
@@ -252,17 +270,18 @@ Built and run instead of the per-cycle statistics report: the pipeline samples e
 too coarse for gaps that last a block or two. See §6 for the result. To repeat it (e.g. on a private RPC, or at a volatile
 time): `python gap_monitor.py --minutes 120`, then `python gap_monitor.py --report`.
 
-### Step 3: Find the best trade size per route
+### Step 3: DONE (2026-10-19): `--size-search` (result in §6)
 ```
 Add an optional size search, wired through both scanner.py and pipeline.py (--size-search flag in both). For the top 3 routes of each token, evaluate net profit at $100, $250, $500, $1,000, $2,500 and $5,000, then refine around the best with a few more points. Record the best size and its net in results.jsonl. If the best-size net clears --min-profit, run confirm_route_on_fork at that size, and only a fork-confirmed result gets the banner. Default behaviour without the flag stays unchanged. Add regression tests, run pytest -v tests/, then run one pipeline cycle with --size-search and compare it with logs/20261016-100048/results.jsonl.
 ```
 
-### Step 4: Cover Uniswap V4
+### Step 4: DONE (2026-10-19): Uniswap V4 hookless pools (see CLAUDE.md; result in §6)
 ```
 Research and add Uniswap V4 as a fourth pool kind (`univ4`) in scanner.py. Scope: hookless pools only (hooks == address(0)). Hooked pools are SKIPPED at discovery and logged as 'skipped: hooked'. They are not a safety failure, never fail the token and never cause a blacklist entry. Discover pools by computing PoolIds for the standard fee/tickSpacing combos against both WETH and native ETH (treat native ETH as the WETH base and say how you handle wrap/unwrap) and reading StateView, not by scanning logs. Quote with the V4 Quoter in next-block context like Slipstream, with the same QUOTE_GAS cap and partial-fill guard. Swap on the fork through the Universal Router plus Permit2 (or a minimal unlockCallback test contract). Extend simulate_all_pools, the owner probes and confirm_route_on_fork so V4 pools get the same buy/transfer/sell checks. Verify every address on-chain against Uniswap's official deployment list (two independent checks, never hand-typed), add the kind to the 'Authorized pool types' table in CLAUDE.md, add tests (quote == real swap, hooked pool skipped, native-ETH pool), run pytest -v tests/, then show which seed tokens gain qualifying pools. Tell me if any of this is wrong.
 ```
 
-### Step 5: Private RPC
+### Step 5: wiring DONE (2026-10-19); still needs Ken's private RPC URL in `.env` as `BASE_RPC_URL=...`
+Benchmark on the public RPC is in §6. Re-run `python rpc_bench.py --workers 2` once the key is in, to check the quota.
 ```
 Add a private Base RPC as the UPSTREAM that anvil forks copy from: BASE_RPC_URL in a gitignored .env, loaded with python-dotenv in pipeline.py, scanner.py and tests/conftest.py. Keep RPC_URL meaning 'the endpoint the scanner talks to' (usually the local fork) and do not merge the two. Never print or log the URL: redact it to scheme+host in pipeline.py's startup line (~line 550) and in scanner.py's 'Connected to' line (~1185), and make sure error strings written to results.jsonl and the per-token logs can't contain it. Add a test that runs one cycle with a fake BASE_RPC_URL containing 'SECRETKEY' and asserts that string never shows up in stdout, results.jsonl or logs. Document it in CLAUDE.md and confirm .env is gitignored. Then benchmark one cycle with 2 vs 4 workers and report the RPC request count/compute units used, so I can check it against my plan's quota.
 ```
