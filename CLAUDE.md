@@ -282,6 +282,63 @@ The pipeline samples each token once per ~15-min cycle; gaps live for seconds. T
 - RPC budget: `python rpc_bench.py --workers N` runs one pipeline cycle through a local counting proxy and reports upstream
   calls per method (providers bill per method). The upstream URL is never shown.
 
+## Arb history (`arb_history.py`): what do real arb bots make?
+Gap scans read block-end state, but on Base arbs land *inside* blocks (right behind the swap that opens the gap). So this
+measures the existing atomic-arb market from history, read-only (nothing signed; hooked V4 pools are read, never traded).
+- **Logs:** every Swap event in the window (Uniswap V3 + Slipstream share one event; Aerodrome v2; Uniswap V2-style forks;
+  V4 PoolManager incl. hooks), chunked `eth_getLogs`, range halves on provider errors, resumable (`logs/arb_history.db`).
+  Pools are labelled by `factory()`: `univ3`/`cl1-3`/`aero`/`univ4` = venues we trade, the rest `other_*`.
+  V4 PoolIds are mapped to keys via PositionManager `poolKeys` (verified by re-hashing). Ids it doesn't know
+  (hook-managed liquidity: 4,298 across 2026-10-17..19) come from the **PoolManager's own `Initialize` event**:
+  `locate_v4_inits` bisects each pool's creation block to a 100-block window, sharing one Multicall per interval per
+  round. The probe is `PoolManager.extsload(keccak(id, 6))` (slot0 sqrtPrice != 0 = exists; never un-initialized, so
+  monotone). It's checked against StateView by `test_v4_existence_probe_reads_the_pool_managers_own_storage`, and works
+  at any block since the deployment (archive `eth_call`: Blast, Tenderly, dRPC, mainnet.base.org). Then one 100-block
+  `getLogs` per window gives the key, re-hashed against the id. Resumable (`windows` / `on_round` checkpoints). Ids still
+  unresolved stay `unknown_pool`, kept out of the totals. **Never guess a V4 key from transfer amounts:** a hook fee
+  broke the match and the "missing" side was assumed native ETH, which booked a fake 2.9M-ETH arb.
+- **Candidate:** 2+ distinct pools and a loop (a token paid into an earlier swap comes out of a later one; holds in any
+  log order, since nested callbacks emit inner swaps first). Plain A→B→C trades never qualify.
+- **Arb + profit (receipt):** net flow per asset **at the venue edge**: ERC20 Transfers out of the swapped pools / the
+  PoolManager (hooked pools' hook contracts count as inside, but only their transfers with tx.from/to) minus Transfers
+  into them. Not the `{from, to}` balance: real bots flash-borrow from the PoolManager and pay
+  profit to a third address (`0x8d48…` → `0x7190…`), which an actor-balance view misses. WETH = native ETH; native V4
+  legs come from the Swap event. Arb = flow worth > 0 and its biggest gain is an asset the tx also paid in. Valued at
+  the anchor (last anchor swap before the block; non-base tokens at the tx's own swap rates), minus L2 gas + `l1Fee`.
+  Priority = gasUsed × (effectiveGasPrice − baseFee). Backrun = tx index − 1 swapped on one of the arb's pools.
+- **Hooked V4 Swap events can lie** (a hook moves value with return-deltas): that's why profit comes from Transfer logs,
+  and why a hooked pool with a native-ETH leg is `hooked_native` (not valued: its ETH movement has no log).
+- **LP rebalances are not arbs:** a tx where a swapped pool / the PoolManager also emits Mint/Burn/Collect/
+  ModifyLiquidity is `lp_action`. Tokens leave the pool with nothing paid in; before this rule the day's "top arbs"
+  ($5k each) were all V3 Burn+Collect rebalances.
+- **Validated** on 5 arbs incl. the day's 3 largest (`test_known_mainnet_arbs`): each recipient's balance diff N-1→N
+  equals the measured profit exactly.
+- **Attempts (`--attempts N`):** a losing attempt leaves no Swap log (it reverts, or the bot's contract checks the
+  price and returns early, which succeeds and still burns gas), so every N-th block's receipts are read
+  (`eth_getBlockReceipts`: Tenderly, dRPC, mainnet.base.org; Blast refuses). Every tx to a known bot contract or from a
+  known bot EOA counts. Per bot: arb net (all blocks) − gas of its non-arb txs (sampled, scaled ×N) = true net.
+- **Blind spots:** loops mostly through PancakeSwap V3 / Balancer / Curve are missed (their Swap events aren't pulled);
+  attempts by bots that never landed an arb in the window aren't attributed to anyone.
+- **RPC:** `mainnet.base.org` refuses `eth_getLogs` under any load. dRPC's free tier works: ~100-block ranges, batches > 1
+  partly fail (use parallel single calls: `--max-batch 1 --threads 4`). A 24 h run ≈ 70k receipts.
+- Commands: `python arb_history.py --hours 24 --rpc https://base.drpc.org` · `--to-block N` (window ends at N; a DB is
+  locked to one range, so use `--db` for another window) · `--report` · `--rejudge` (re-classify from
+  stored receipts) · `--tx 0x…` (explain one tx).
+
+## Flashblock recorder (`flashblock_recorder.py`): react or pre-queued?
+On 2026-10-19 only ~5% of real arb profit came from gaps already open at block start (`arb_history` `trigger_gap`
+NULL), which is all a block-end scanner can see; ~64% landed right behind the swap that opened the gap. Base streams
+each block as ~11 flashblocks (~200ms apart, index 0 = the system deposit) on `wss://mainnet.flashblocks.base.org/ws`
+(public, brotli-compressed JSON, read-only). History keeps no flashblock boundaries, so this records them live.
+- Stores per flashblock: block, index, the block tx-index range it added, arrival time (`logs/flashblocks.db`).
+  Verified against the chain: per-block tx counts and tx positions (hash of the streamed raw tx at that index) match.
+- A block is **untrusted** (table `gaps`, never used) if the stream joined mid-block, skipped an index or a block, or
+  reconnected. `flashblock_of()` returns None there; never guess a range.
+- `--timing <arb_history db>` (run arb_history over the recorded window with `--to-block`): each arb's flashblock minus
+  its trigger swap's. 0 = same flashblock (the bot was already queued: spam / priority), ≥1 = it reacted to the stream,
+  which a new bot could do too. "block start" = gap open before the block.
+- Commands: `python flashblock_recorder.py --hours 6` · `--report` · `--timing logs/arb_history_fb.db`.
+
 ## Tests
 `pytest -v tests/` starts its own anvil fork on port 8546, so it doesn't clash with a fork on 8545. It compiles
 `tests/contracts/src/Trap.sol` with forge and deploys fake tokens with $60k Aerodrome pools
@@ -310,11 +367,19 @@ The pipeline samples each token once per ~15-min cycle; gaps live for seconds. T
 - `test_uniswap_v4.py` (10): deployment links, PoolId derivation, discovery for USDC + native ETH, hooked keys skipped,
   band walk == quoter, quote == real swap both ways (ERC20 and native ETH via WETH), oversize quote → 0, cbBTC fork sim on
   V4 pools + mixed routes, gap monitor V4 mid price.
+- `test_arb_history.py` (29): swap decoding (V4 sign flip), loop detection in any log order, venue-edge profit incl.
+  profit forwarded to a third address and PoolManager flash loans, user trades rejected, native V4 legs, unresolved
+  V4 pools / hooked native legs / LP rebalances not valued, hook-contract transfers inside the venue, V4 key re-hash,
+  report math (seed split, top-3 shares, medians), backrun lookup, range shrinking, URL scrubbing, 5 validated mainnet
+  arbs + 1 real arb on an unresolvable pool flagged (receipts via the public RPC), seed bucket pinned to the seed list,
+  V4 Initialize locator (bisection, resume, extsload probe vs StateView live), attempt extraction + true-net math.
+- `test_flashblock_recorder.py` (4): tx ranges per flashblock, untrusted blocks (mid-block join, missing index, skipped
+  block), arb timing relative to the trigger, per-token buckets, flashblock arrival spacing.
 - `test_slipstream.py` (7): discovery for both bases plus pool→factory linkage, quote == real swap, oversize quote →
   0, CL routes mixed with legacy pools, registry ↔ deployments tripwire, shared-tick-spacing quoter routing,
   next-block quote context. The quote==swap test pins the swap's timestamp to the quote's (dynamic fees decay with time).
 The test deployer gets USDC by minting through Circle's masterMinter (impersonated on the fork), **not** by swapping.
-Swapping $600k through the anchor moved its price and broke later tests. Takes about 23 minutes (95 tests). Needs Foundry and internet. **Add a test whenever a new trap type or route shape is handled.**
+Swapping $600k through the anchor moved its price and broke later tests. Takes about 23 minutes (128 tests). Needs Foundry and internet. **Add a test whenever a new trap type or route shape is handled.**
 
 ## Tech stack
 - **Python 3** + **web3.py**: scanning, quoting, simulation driver
@@ -357,5 +422,6 @@ plus `--priority-gwei` (default 0.001) instead, so fork and live gas estimates m
 - Against a local fork: `anvil --fork-url https://mainnet.base.org`, then `RPC_URL=http://127.0.0.1:8545 python scanner.py`
 - Tests: `pytest -v tests/`
 - Pipeline: `python pipeline.py [--loop] [--workers N] [--tokens 0x..,0x..] [--recheck]`
+- Arb market history: `python arb_history.py --hours 24 --rpc https://base.drpc.org`, then `--report`
 - Safety knobs: `--min-liquidity 50000` (per pool, USD), `--max-tax 0.5` (percent), `--priority-gwei 0.001`
 - Routing knobs: `--settle native|usdc`, `--gas-overhead 60000`, `--gas-per-swap 120000`, `--size-search`

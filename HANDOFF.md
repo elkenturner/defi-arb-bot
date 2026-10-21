@@ -225,6 +225,29 @@ venues not yet covered (Uniswap V4), at different trade sizes, or on newer/small
 - Between the two benchmark runs (30 min apart), cbETH's main Slipstream pool fell from $216k to $23k (an LP left), so
   cbETH went THIN. Pool depth on long-tail venues really does change by the hour.
 
+**Arb market history, 2026-10-19 (`arb_history.py`, last 24 h = blocks 52,792,186–52,835,385, read-only).**
+The question changed from "is there a gap at block end?" to "what did real arb bots actually earn?", because Base arbs
+land inside blocks. 1.65M swaps → 138,741 txs on 2+ pools → 41,849 loop-shaped → **24,052 atomic arbs by 248 bot contracts**.
+| | per day |
+|---|---|
+| Net profit after gas, all bots | **$4,855** (gross $6,592) |
+| our 13 safe seed tokens | $171 |
+| WETH/USDC only | $323 |
+| everything else | $4,360 (on venues we already scan, no hooks: $3,985) |
+| hooked V4 pools (measurable ones) | $152 |
+- **Lumpy:** only 314 arbs cleared $1 net, 58 cleared $10 and they made 73% of the day. One USDT dislocation
+  (≈100 blocks) was **$1,985, 41% of the day**; the single biggest arb was $1,300 (bot `0xe8c3…`, USDT/USDC across
+  CL1/V3/V4). The typical arb earns cents: median net ≈ $0.00, median gas = 82% of gross.
+- **Competition:** top 3 bots take 43% overall, but **per token the top 3 take 90–100%** for most of the top 30
+  (exceptions: XDP 33%, STONKEX 40%, CTR 46%, cbBTC 46%, SYND 48%). Median priority fee = 18.5% of gross profit; 16% of
+  arbs are direct backruns of the previous tx.
+- **Not counted:** 7,232 loop-shaped txs touch 1,885 V4 pools with unknown keys (hook-launchpad liquidity). A rough,
+  unverified side estimate is ≤ $14k/day before gas, probably inflated by user trades paying native ETH. Reverted arb
+  attempts aren't visible, so bots' real net is lower than shown. PancakeSwap/Balancer/Curve loops aren't pulled.
+- Errors caught on the way, now regression-tested: profit paid to third addresses (missed by an actor-balance view),
+  guessed V4 keys (fake 2.9M-ETH arb), LP Burn+Collect rebalances posing as $5k arbs.
+- Validated: 5 arbs (incl. the day's 3 largest) match their recipients' on-chain balance change exactly.
+
 ## 7. Known gaps and limitations
 
 - **Uniswap V4: hookless pools at the 4 standard fee/tick pairs only.** Hooked pools (most V4 memecoin/Zora/Clanker
@@ -241,6 +264,9 @@ venues not yet covered (Uniswap V4), at different trade sizes, or on newer/small
 
 ## 8. Open questions for Ken (good planning topics)
 
+0. **Arb history verdict (2026-10-19, one day):** ~$4.4k/day of non-seed arb profit exists, mostly on venues we scan,
+   but it's lumpy (one event = 41%) and each token is owned by 1–3 bots. See §6. Decide whether to (a) re-run a few more
+   days to see if it's typical, (b) look at the top tokens' bots and latency, or (c) stop.
 1. **Is there money here at all?** Decide what evidence would justify building the trading contract: e.g. "a
    fork-confirmed hit > $1 at least N times a week over two weeks of continuous scanning".
 2. **Which direction first?** (a) watch longer and gather statistics, (b) widen coverage (Uniswap V4, more/newer

@@ -10,3 +10,4 @@ blacklist.*.json
 .DS_Store
 *.db
 *.log
+business/
