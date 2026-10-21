@@ -416,12 +416,13 @@ def locate_v4_inits(ids, lo, hi, is_init, width=100, threads=8, log=None, window
     return {pid: ab for ab, pids in groups.items() for pid in pids}
 
 
-def pool_meta_v4(rpc, ids, call_rpc=None, head=None, log=print, threads=8, windows=None, on_round=None):
+def pool_meta_v4(rpc, ids, call_rpc=None, head=None, log=print, threads=8, windows=None, on_round=None, on_found=None):
     """PoolId -> key. First the PositionManager's poolKeys (pools that ever had a position minted through it). The rest
     (mostly hook-managed liquidity) from the PoolManager's own Initialize event: `locate_v4_inits` narrows each pool's
     creation to a 100-block window by reading its state at past blocks (`call_rpc`, archive eth_call), then that window's
     Initialize logs (`rpc`, 100-block eth_getLogs) give the key. Every key is re-hashed against its PoolId: a key is
-    never inferred from transfers. -> (found, missing)."""
+    never inferred from transfers. A window whose logs keep failing is skipped (its pools stay missing, a rerun retries
+    them); `on_found(keys)` gets each window's keys as they arrive, so a long run can save as it goes. -> (found, missing)."""
     raw = multicall(rpc, [(scanner.UNI_V4_POSITION_MANAGER, "0x" + SEL_POOL_KEYS +
                            encode(["bytes25"], [bytes.fromhex(pid[2:52])]).hex()) for pid in ids])
     out, missing = {}, []
@@ -447,7 +448,10 @@ def pool_meta_v4(rpc, ids, call_rpc=None, head=None, log=print, threads=8, windo
         (a, b), pids = item
         found = {}
         for i in range(0, len(pids), 100):
-            logs, _ = fetch_logs(rpc, {"address": POOL_MANAGER, "topics": [T_V4_INIT, pids[i:i + 100]]}, a + 1, b, 100)
+            try:
+                logs, _ = fetch_logs(rpc, {"address": POOL_MANAGER, "topics": [T_V4_INIT, pids[i:i + 100]]}, a + 1, b, 100)
+            except ConnectionError:
+                return None
             for lg in logs:
                 fee, ts, hooks = decode(["uint24", "int24", "address"], bytes.fromhex(lg["data"][2:])[:96])
                 m = v4_meta_from_key(L(lg["topics"][1]), "0x" + lg["topics"][2][-40:], "0x" + lg["topics"][3][-40:],
@@ -456,11 +460,18 @@ def pool_meta_v4(rpc, ids, call_rpc=None, head=None, log=print, threads=8, windo
                     found[L(lg["topics"][1])] = m
         return found
 
+    failed = 0
     with ThreadPoolExecutor(threads) as ex:
         for n, found in enumerate(ex.map(logs_for, by_win.items()), 1):
+            if found is None:
+                failed += 1
+                continue
             out |= found
-            log(f"\r  Initialize logs: {n}/{len(by_win)} windows, {sum(p in out for p in missing)} keys   ", end="")
-    log("")
+            if on_found and found:
+                on_found(found)
+            log(f"\r  Initialize logs: {n}/{len(by_win)} windows, {sum(p in out for p in missing)} keys, "
+                f"{failed} failed   ", end="")
+    log(f"\n  {failed} windows skipped (RPC kept failing): rerun to retry them" if failed else "")
     return out, [p for p in missing if p not in out]
 
 
@@ -603,8 +614,7 @@ def resolve_pools(db, rpc, log=print, call_rpc=None, head=None):
         save_pool_meta(db, pool_meta_v2v3(rpc, plain[i:i + 3000], need))
         db.commit()
     if v4:
-        found, missing = pool_meta_v4(rpc, v4, call_rpc, head, log)
-        save_pool_meta(db, found)
+        found, missing = pool_meta_v4(rpc, v4, call_rpc, head, log, on_found=lambda f: save_pool_meta(db, f))
         db.commit()
         if missing:
             log(f"  {len(missing)} V4 PoolIds unresolved: txs using them are counted as unknown_pool")
@@ -813,35 +823,48 @@ def scan_attempts(db, rpc, every=5, threads=8, log=print):
     log(f"\n  {skipped} blocks skipped (RPC kept failing): rerun --attempts to fill them" if skipped else "")
 
 
-def attempt_summary(attempts, arbs, sampled_blocks, total_blocks, hours):
-    """Per bot: attempts vs arbs, and true net = arb net (all blocks) minus the gas of its non-arb txs (sampled blocks,
-    scaled up). attempts: [(tx, block, txi, bot, eoa, status, gas_usd)]; arbs: dicts with tx, bot, net_usd. Pure."""
+def attempt_summary(attempts, arbs, sampled_blocks, total_blocks, hours, swapped=(), loops=()):
+    """Per contract: attempts vs arbs, and true net = arb net (all blocks) minus the gas of its non-arb txs (sampled blocks,
+    scaled up). attempts: [(tx, block, txi, bot, eoa, status, gas_usd)]; arbs: dicts with tx, bot, net_usd; swapped:
+    attempt txs that emitted a Swap; loops: txs that looped through 2+ pools (arb or not). Pure.
+    A contract is a `bot` when its sampled arbs + losing loops are at least its plain trades (swaps that weren't a loop).
+    Otherwise it's `mixed`: a public router, an ERC-4337 EntryPoint, or a bot that also runs other strategies (a CEX-DEX
+    arb is one plain swap). Its other txs aren't failed arb attempts, so its waste is shown but kept out of the totals."""
     per_day, scale = 24 / hours, total_blocks / sampled_blocks if sampled_blocks else 0
-    arb_tx = {a["tx"] for a in arbs}
+    arb_tx, swapped, loops = {a["tx"] for a in arbs}, set(swapped), set(loops)
     net = Counter()
     for a in arbs:
         net[a["bot"]] += a["net_usd"]
-    stats = defaultdict(lambda: {"txs": 0, "arbs": 0, "reverted": 0, "noop": 0, "wasted_gas": 0.0})
+    stats = defaultdict(lambda: {"txs": 0, "arbs": 0, "reverted": 0, "noop": 0, "loops": 0, "plain": 0,
+                                 "wasted_gas": 0.0})
     for tx, _, _, bot, _, status, gas in attempts:
         st = stats[bot]
         st["txs"] += 1
         if tx in arb_tx:
             st["arbs"] += 1
-        else:
-            st["reverted" if status == 0 else "noop"] += 1
-            st["wasted_gas"] += gas
+            continue
+        st["reverted" if status == 0 else "noop"] += 1
+        st["wasted_gas"] += gas
+        if tx in loops:
+            st["loops"] += 1
+        elif tx in swapped:
+            st["plain"] += 1
     rows = []
     for bot in set(net) | set(stats):
         st = stats[bot]
         arb_day, waste_day = net[bot] * per_day, st["wasted_gas"] * scale * per_day
-        rows.append({"bot": bot, "arb_net_usd_day": arb_day, "wasted_gas_usd_day": waste_day,
+        rows.append({"bot": bot, "kind": "bot" if st["arbs"] + st["loops"] >= st["plain"] else "mixed",
+                     "arb_net_usd_day": arb_day, "wasted_gas_usd_day": waste_day,
                      "true_net_usd_day": arb_day - waste_day, "sample_txs": st["txs"], "sample_arbs": st["arbs"],
-                     "sample_reverted": st["reverted"], "sample_noop": st["noop"],
+                     "sample_reverted": st["reverted"], "sample_noop": st["noop"], "sample_losing_loops": st["loops"],
+                     "sample_plain_trades": st["plain"],
                      "attempts_per_arb": st["txs"] / st["arbs"] if st["arbs"] else None})
     rows.sort(key=lambda r: -r["arb_net_usd_day"])
-    tot = {k: sum(r[k] for r in rows) for k in ("arb_net_usd_day", "wasted_gas_usd_day", "true_net_usd_day",
-                                                "sample_txs", "sample_arbs", "sample_reverted", "sample_noop")}
-    return {"bots": rows, "total": tot, "scale": scale}
+    keys = ("arb_net_usd_day", "wasted_gas_usd_day", "true_net_usd_day", "sample_txs", "sample_arbs",
+            "sample_reverted", "sample_noop", "sample_losing_loops", "sample_plain_trades")
+    tot = {kind: {k: sum(r[k] for r in rows if r["kind"] == kind) for k in keys} | {
+        "contracts": sum(r["kind"] == kind for r in rows)} for kind in ("bot", "mixed")}
+    return {"bots": rows, "total": tot["bot"], "mixed": tot["mixed"], "scale": scale}
 
 
 def print_attempts(db, hours):
@@ -849,17 +872,26 @@ def print_attempts(db, hours):
     if not sampled:
         return None
     total = sum(e - s + 1 for s, e in db.execute("SELECT start, end FROM chunks"))
+    db.execute("CREATE INDEX IF NOT EXISTS swaps_tx ON swaps(tx)")
+    swapped = [t for (t,) in db.execute("SELECT DISTINCT tx FROM swaps WHERE tx IN (SELECT tx FROM attempts)")]
+    loops = [t for (t,) in db.execute("SELECT tx FROM checked")]
     s = attempt_summary(db.execute("SELECT * FROM attempts").fetchall(),
                         [{"tx": t, "bot": b, "net_usd": n} for t, b, n in db.execute("SELECT tx, bot, net_usd FROM arbs")],
-                        sampled, total, hours)
-    t = s["total"]
-    print(f"\n  Attempts (1 in {s['scale']:.0f} blocks sampled, {sampled:,} blocks): {t['sample_txs']:,} bot txs = "
-          f"{t['sample_arbs']:,} arbs + {t['sample_noop']:,} no-arb successes + {t['sample_reverted']:,} reverts")
-    print(f"    all bots: arb net ${t['arb_net_usd_day']:,.0f}/day - gas of attempts that made nothing "
+                        sampled, total, hours, swapped, loops)
+    t, m = s["total"], s["mixed"]
+    print(f"\n  Attempts (1 in {s['scale']:.0f} blocks sampled, {sampled:,} blocks)")
+    print(f"    {t['contracts']} arb-bot contracts: {t['sample_txs']:,} txs = {t['sample_arbs']:,} arbs + "
+          f"{t['sample_losing_loops']:,} losing loops + {t['sample_noop'] - t['sample_losing_loops']:,} other no-arb "
+          f"successes + {t['sample_reverted']:,} reverts")
+    print(f"      arb net ${t['arb_net_usd_day']:,.0f}/day - gas of attempts that made nothing "
           f"${t['wasted_gas_usd_day']:,.0f}/day = true net ${t['true_net_usd_day']:,.0f}/day")
-    print(f"    {'bot':<44}{'arb net/d':>10}{'waste/d':>9}{'true/d':>9}{'txs/arb':>9}{'reverts':>9}{'no-ops':>8}")
+    print(f"    {m['contracts']} mixed contracts (routers, ERC-4337 EntryPoints, bots with other strategies: plain trades "
+          f"> arbs + losing loops): arb net ${m['arb_net_usd_day']:,.0f}/day; their other txs "
+          f"(${m['wasted_gas_usd_day']:,.0f}/day of gas) aren't arb attempts")
+    print(f"    {'contract':<44}{'kind':>6}{'arb net/d':>10}{'waste/d':>9}{'true/d':>9}{'txs/arb':>9}{'reverts':>9}"
+          f"{'no-ops':>8}")
     for r in s["bots"][:25]:
-        print(f"    {r['bot']:<44}{r['arb_net_usd_day']:>10,.0f}{r['wasted_gas_usd_day']:>9,.0f}"
+        print(f"    {r['bot']:<44}{r['kind']:>6}{r['arb_net_usd_day']:>10,.0f}{r['wasted_gas_usd_day']:>9,.0f}"
               f"{r['true_net_usd_day']:>9,.0f}{(r['attempts_per_arb'] or 0):>9.1f}{r['sample_reverted']:>9,}"
               f"{r['sample_noop']:>8,}")
     return s

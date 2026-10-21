@@ -236,17 +236,35 @@ land inside blocks. 1.65M swaps → 138,741 txs on 2+ pools → 41,849 loop-shap
 | everything else | $4,360 (on venues we already scan, no hooks: $3,985) |
 | hooked V4 pools (measurable ones) | $152 |
 - **Lumpy:** only 314 arbs cleared $1 net, 58 cleared $10 and they made 73% of the day. One USDT dislocation
-  (≈100 blocks) was **$1,985, 41% of the day**; the single biggest arb was $1,300 (bot `0xe8c3…`, USDT/USDC across
+  (a single-block backrun, not a lasting gap) was **$1,985, 41% of the day**; the single biggest arb was $1,300 (bot `0xe8c3…`, USDT/USDC across
   CL1/V3/V4). The typical arb earns cents: median net ≈ $0.00, median gas = 82% of gross.
 - **Competition:** top 3 bots take 43% overall, but **per token the top 3 take 90–100%** for most of the top 30
   (exceptions: XDP 33%, STONKEX 40%, CTR 46%, cbBTC 46%, SYND 48%). Median priority fee = 18.5% of gross profit; 16% of
   arbs are direct backruns of the previous tx.
-- **Not counted:** 7,232 loop-shaped txs touch 1,885 V4 pools with unknown keys (hook-launchpad liquidity). A rough,
-  unverified side estimate is ≤ $14k/day before gas, probably inflated by user trades paying native ETH. Reverted arb
-  attempts aren't visible, so bots' real net is lower than shown. PancakeSwap/Balancer/Curve loops aren't pulled.
+- **Not counted at first:** 7,232 loop-shaped txs on 1,885 V4 pools with unknown keys and a rough "≤ $14k/day" estimate.
+  Resolved on 2026-10-20 (below): that turned out to be ~$30/day. PancakeSwap/Balancer/Curve loops aren't pulled.
 - Errors caught on the way, now regression-tested: profit paid to third addresses (missed by an actor-balance view),
   guessed V4 keys (fake 2.9M-ETH arb), LP Burn+Collect rebalances posing as $5k arbs.
 - Validated: 5 arbs (incl. the day's 3 largest) match their recipients' on-chain balance change exactly.
+
+**Blind spots closed, 2026-10-20 (3 days: blocks 52,705,786–52,835,385, plus 6 h of live Flashblocks).**
+- **Unknown V4 pools:** all 4,298 PoolIds resolved from the PoolManager's own `Initialize` events (bisecting each pool's
+  creation block by reading PoolManager storage at past blocks, then one 100-block log query). The rough ≤ $14k/day
+  (day 2) / $12k/day (prior 48 h) gross became **$30 and $36/day net, all on hooked pools, hookless $0**: 2/3 of those
+  txs weren't loops once their tokens were known (plain trades), most of the rest were LP actions. Totals after the
+  re-judge: $4,885/day (day 2), $4,536/day (prior 48 h).
+- **Failed attempts (1 in 5 blocks of day 2):** 159 arb-bot contracts sent ~10 txs per arb: 2,027 arbs, 9,745 reverts,
+  686 losing loops, 8.5k early-return no-ops in the sample. **$3,930/day of arbs − $1,238/day of wasted gas = $2,692/day
+  true net** (≈ $0.013 per failed tx). A first pass said −$3.3k/day: it counted ERC-4337 EntryPoints and SwapRouter02
+  (which once carried an arb) as bots and their users' trades as waste. Fixed and tested.
+- **React or pre-queued (Flashblocks):** of arbs placed in their flashblock (3,073, over 3.1 h of trusted blocks), the
+  profit sits in the **same flashblock as the swap that opened the gap: $439, avg $0.42/arb** (plus one $2,039 ZORA arb).
+  Arbs one flashblock later: $37 (avg $0.02); two or more later: $1; gap already open at block start: $20. For XDP,
+  STONKEX, CTR, fBOMB, SYND and DRV together: same flashblock $72, later $9, block start $1.
+- **Verdict on a new "react within 1 flashblock" bot** on the tokens where the top 3 take < 50% (XDP, STONKEX, fBOMB,
+  CTR, cbBTC, DRV, SYND, AERO, TEVA, TIBBIR; $200–550/day for all bots together): the reachable part is about $5–60/day
+  before its own failed attempts, which can cost as much as it earns. **Roughly −$15 to +$60/day, most likely near zero**,
+  before any server or RPC cost. Not worth building as specified. Details in the session answer.
 
 ## 7. Known gaps and limitations
 
@@ -264,9 +282,11 @@ land inside blocks. 1.65M swaps → 138,741 txs on 2+ pools → 41,849 loop-shap
 
 ## 8. Open questions for Ken (good planning topics)
 
-0. **Arb history verdict (2026-10-19, one day):** ~$4.4k/day of non-seed arb profit exists, mostly on venues we scan,
-   but it's lumpy (one event = 41%) and each token is owned by 1–3 bots. See §6. Decide whether to (a) re-run a few more
-   days to see if it's typical, (b) look at the top tokens' bots and latency, or (c) stop.
+0. **Arb history verdict (2026-10-20, three days + Flashblocks):** ~$4.5–4.9k/day is real but lumpy, the arb bots'
+   true net is ~$2.7k/day after failed attempts, and ~95% of the profit is won by txs already queued when the gap opens.
+   A bot that reacts to the stream would net about zero. Options: (a) stop atomic DEX-DEX arb, (b) study how the
+   same-flashblock winners get there (spam rate, priority, which tokens), knowing it's a gas war, (c) look at other
+   strategies (e.g. CEX-DEX, which shows up here as "mixed" contracts).
 1. **Is there money here at all?** Decide what evidence would justify building the trading contract: e.g. "a
    fork-confirmed hit > $1 at least N times a week over two weeks of continuous scanning".
 2. **Which direction first?** (a) watch longer and gather statistics, (b) widen coverage (Uniswap V4, more/newer

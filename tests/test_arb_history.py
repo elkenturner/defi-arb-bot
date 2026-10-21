@@ -371,7 +371,47 @@ def test_attempt_summary_scales_waste_and_subtracts_it():
     assert r1["true_net_usd_day"] == pytest.approx(27.0)
     assert (r1["sample_reverted"], r1["sample_noop"], r1["attempts_per_arb"]) == (1, 1, 3.0)
     assert s["bots"][0]["bot"] == b1
-    assert s["total"]["wasted_gas_usd_day"] == pytest.approx(5.0 + 0.1 * 5 * 2)
+    assert s["total"]["wasted_gas_usd_day"] == pytest.approx(5.0 + 0.1 * 5 * 2)   # no swaps given: both are bots
+
+
+def test_v4_initialize_logs_skip_failing_windows_and_save_as_they_go(monkeypatch):
+    """One window whose getLogs keeps failing must not lose every other window's keys (a 70-min run died that way at
+    3,568/4,046): it's skipped and stays missing, and found keys reach on_found as they arrive."""
+    good = scanner.v4_pool_id((scanner.ZERO, scanner.USDC, 500, 10, scanner.ZERO))
+    bad = "0x" + "ab" * 32
+    monkeypatch.setattr(ah, "multicall", lambda rpc, calls, *a, **k: [b""] * len(calls))   # PositionManager: unknown
+    monkeypatch.setattr(ah, "locate_v4_inits", lambda ids, *a, **k: {good: (100, 200), bad: (300, 400)})
+
+    def fake_logs(rpc, flt, a, b, span):
+        if a > 300:
+            raise ConnectionError("RPC kept failing")
+        data = encode(["uint24", "int24", "address", "uint160", "int24"], [500, 10, scanner.ZERO, 2**96, 0])
+        return [{"topics": [ah.T_V4_INIT, good, "0x" + "00" * 32, "0x" + "00" * 12 + scanner.USDC[2:].lower()],
+                 "data": "0x" + data.hex()}], span
+    monkeypatch.setattr(ah, "fetch_logs", fake_logs)
+    saved = []
+    found, missing = ah.pool_meta_v4(None, [good, bad], call_rpc=object(), head=500, log=lambda *a, **k: None,
+                                     threads=1, on_found=saved.append)
+    assert set(found) == {ah.L(good)} and found[ah.L(good)]["token1"] == scanner.USDC.lower()
+    assert missing == [bad] and saved == [found]
+
+
+def test_public_contracts_with_one_arb_are_not_counted_as_bots():
+    """An EntryPoint or router that once carried an arb must not have its users' trades booked as failed arb attempts
+    (that made the 2026-10-19 market look $3.3k/day net-negative)."""
+    bot, router = "0x" + "b1" * 20, "0x" + "e1" * 20
+    arbs = [{"tx": "0xa1", "bot": bot, "net_usd": 5.0}, {"tx": "0xa2", "bot": router, "net_usd": 1.0}]
+    attempts = [("0xa1", 0, 0, bot, "e", 1, 0.1), ("0xl1", 0, 1, bot, "e", 1, 0.2),     # arb + a losing loop
+                ("0xp1", 0, 2, bot, "e", 1, 0.3), ("0xr1", 0, 3, bot, "e", 0, 0.4),     # a plain trade + a revert
+                ("0xa2", 1, 0, router, "u", 1, 0.1)] + [
+                (f"0xu{i}", 1, i + 1, router, f"u{i}", 1, 1.0) for i in range(3)]       # users' plain trades
+    s = ah.attempt_summary(attempts, arbs, sampled_blocks=1, total_blocks=1, hours=24,
+                           swapped={"0xa1", "0xl1", "0xp1", "0xa2", "0xu0", "0xu1", "0xu2"}, loops={"0xa1", "0xl1", "0xa2"})
+    kinds = {r["bot"]: r["kind"] for r in s["bots"]}
+    assert kinds == {bot: "bot", router: "mixed"}                       # bot: 1 arb + 1 loop >= 1 plain trade
+    assert s["total"]["contracts"] == 1 and s["total"]["wasted_gas_usd_day"] == pytest.approx(0.9)
+    assert s["total"]["true_net_usd_day"] == pytest.approx(4.1)
+    assert s["mixed"]["arb_net_usd_day"] == pytest.approx(1.0) and s["mixed"]["wasted_gas_usd_day"] == pytest.approx(3.0)
 
 
 def test_v4_existence_probe_reads_the_pool_managers_own_storage():

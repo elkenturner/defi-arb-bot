@@ -294,8 +294,11 @@ measures the existing atomic-arb market from history, read-only (nothing signed;
   round. The probe is `PoolManager.extsload(keccak(id, 6))` (slot0 sqrtPrice != 0 = exists; never un-initialized, so
   monotone). It's checked against StateView by `test_v4_existence_probe_reads_the_pool_managers_own_storage`, and works
   at any block since the deployment (archive `eth_call`: Blast, Tenderly, dRPC, mainnet.base.org). Then one 100-block
-  `getLogs` per window gives the key, re-hashed against the id. Resumable (`windows` / `on_round` checkpoints). Ids still
-  unresolved stay `unknown_pool`, kept out of the totals. **Never guess a V4 key from transfer amounts:** a hook fee
+  `getLogs` per window gives the key, re-hashed against the id. Resumable (`windows` / `on_round` checkpoints); a
+  window whose logs keep failing is skipped (rerun retries it) and keys are saved as they arrive (`on_found`). Ids still
+  unresolved stay `unknown_pool`, kept out of the totals. Result (2026-10-20, all 4,298 resolved): the rough
+  "≤ $14k/day gross" on those txs was **$30–36/day net** (all hooked pools; hookless $0). 2/3 weren't loops once the
+  tokens were known, most of the rest were LP actions. **Never guess a V4 key from transfer amounts:** a hook fee
   broke the match and the "missing" side was assumed native ETH, which booked a fake 2.9M-ETH arb.
 - **Candidate:** 2+ distinct pools and a loop (a token paid into an earlier swap comes out of a later one; holds in any
   log order, since nested callbacks emit inner swaps first). Plain A→B→C trades never qualify.
@@ -317,6 +320,10 @@ measures the existing atomic-arb market from history, read-only (nothing signed;
   price and returns early, which succeeds and still burns gas), so every N-th block's receipts are read
   (`eth_getBlockReceipts`: Tenderly, dRPC, mainnet.base.org; Blast refuses). Every tx to a known bot contract or from a
   known bot EOA counts. Per bot: arb net (all blocks) − gas of its non-arb txs (sampled, scaled ×N) = true net.
+  **Only `bot` contracts count** (sampled arbs + losing loops ≥ plain trades). The rest are `mixed`: ERC-4337
+  EntryPoints, SwapRouter02, aggregators, bots running other strategies. Their users' trades are not failed arb attempts.
+  Counting them made day 2 look −$3.3k/day; arb-only contracts are really +$2.7k/day ($3.9k arbs − $1.2k wasted gas,
+  ~10 txs per arb).
 - **Blind spots:** loops mostly through PancakeSwap V3 / Balancer / Curve are missed (their Swap events aren't pulled);
   attempts by bots that never landed an arb in the window aren't attributed to anyone.
 - **RPC:** `mainnet.base.org` refuses `eth_getLogs` under any load. dRPC's free tier works: ~100-block ranges, batches > 1
@@ -337,6 +344,9 @@ each block as ~11 flashblocks (~200ms apart, index 0 = the system deposit) on `w
 - `--timing <arb_history db>` (run arb_history over the recorded window with `--to-block`): each arb's flashblock minus
   its trigger swap's. 0 = same flashblock (the bot was already queued: spam / priority), ≥1 = it reacted to the stream,
   which a new bot could do too. "block start" = gap open before the block.
+- **Result (2026-10-20, 3.1 h of trusted blocks, 3,073 arbs placed):** excluding one $2,039 ZORA arb, same flashblock
+  $439 (avg $0.42/arb), +1 flashblock $37 (avg $0.02), +2 or more $1, open at block start $20. The money is taken by
+  txs already queued when the gap opened; reacting to the stream wins cents. Flashblock spacing median 166 ms.
 - Commands: `python flashblock_recorder.py --hours 6` · `--report` · `--timing logs/arb_history_fb.db`.
 
 ## Tests
@@ -367,19 +377,20 @@ each block as ~11 flashblocks (~200ms apart, index 0 = the system deposit) on `w
 - `test_uniswap_v4.py` (10): deployment links, PoolId derivation, discovery for USDC + native ETH, hooked keys skipped,
   band walk == quoter, quote == real swap both ways (ERC20 and native ETH via WETH), oversize quote → 0, cbBTC fork sim on
   V4 pools + mixed routes, gap monitor V4 mid price.
-- `test_arb_history.py` (29): swap decoding (V4 sign flip), loop detection in any log order, venue-edge profit incl.
+- `test_arb_history.py` (31): swap decoding (V4 sign flip), loop detection in any log order, venue-edge profit incl.
   profit forwarded to a third address and PoolManager flash loans, user trades rejected, native V4 legs, unresolved
   V4 pools / hooked native legs / LP rebalances not valued, hook-contract transfers inside the venue, V4 key re-hash,
   report math (seed split, top-3 shares, medians), backrun lookup, range shrinking, URL scrubbing, 5 validated mainnet
   arbs + 1 real arb on an unresolvable pool flagged (receipts via the public RPC), seed bucket pinned to the seed list,
-  V4 Initialize locator (bisection, resume, extsload probe vs StateView live), attempt extraction + true-net math.
+  V4 Initialize locator (bisection, resume, extsload probe vs StateView live, failing windows skipped + keys saved as
+  found), attempt extraction + true-net math, public contracts (EntryPoint/router) not counted as bots.
 - `test_flashblock_recorder.py` (4): tx ranges per flashblock, untrusted blocks (mid-block join, missing index, skipped
   block), arb timing relative to the trigger, per-token buckets, flashblock arrival spacing.
 - `test_slipstream.py` (7): discovery for both bases plus pool→factory linkage, quote == real swap, oversize quote →
   0, CL routes mixed with legacy pools, registry ↔ deployments tripwire, shared-tick-spacing quoter routing,
   next-block quote context. The quote==swap test pins the swap's timestamp to the quote's (dynamic fees decay with time).
 The test deployer gets USDC by minting through Circle's masterMinter (impersonated on the fork), **not** by swapping.
-Swapping $600k through the anchor moved its price and broke later tests. Takes about 23 minutes (128 tests). Needs Foundry and internet. **Add a test whenever a new trap type or route shape is handled.**
+Swapping $600k through the anchor moved its price and broke later tests. Takes about 23 minutes (130 tests). Needs Foundry and internet. **Add a test whenever a new trap type or route shape is handled.**
 
 ## Tech stack
 - **Python 3** + **web3.py**: scanning, quoting, simulation driver
