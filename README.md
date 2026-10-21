@@ -17,6 +17,7 @@ price impact (from real on-chain quoters), L2 execution gas and the L1 data fee.
 | `gap_monitor.py` | Watches every block: one Multicall batch reads all pool prices and live dynamic fees, then fully quotes the most promising routes within a ~1.6s budget. Coverage accounting is explicit: every block is either done or counted as missed. |
 | `arb_history.py` | Measures what existing arb bots actually earn: pulls every Swap event for a window, finds loop-shaped transactions, and computes profit from Transfer logs at the venue edge, minus gas. Validated against on-chain balance changes of real arbs. |
 | `flashblock_recorder.py` | Records Base's ~200ms Flashblocks stream to tell whether arbs react to the stream or were already queued. |
+| `cex_markout.py` | Measures the exchange-vs-Base market read-only: every single-pool WETH/USDC and cbBTC/USDC swap marked out against Coinbase's public trade prices at +2/+12/+60 s, grouped by the contract that called the pool, minus gas. |
 | `rpc_bench.py` | Counts upstream RPC calls per method for one pipeline cycle (providers bill per method). |
 
 ## Findings so far
@@ -24,11 +25,17 @@ price impact (from real on-chain quoters), L2 execution gas and the L1 data fee.
 One day of Base history (2026-10-19): about 24k atomic arbs by 248 bot contracts made **~$4.9k net after gas**. The
 profit is lumpy (one stablecoin dislocation was 41% of the day), most arbs earn cents, and for most tokens the top 3 bots
 take 90–100% of the profit. Most of it lands inside blocks, right behind the swap that opens the gap, so a block-end
-scanner sees only a small share. That finding is why the project moved from block-end scanning to history and Flashblocks timing.
+scanner sees only a small share. Flashblocks timing then showed ~98% of that profit lands in the same ~200ms flashblock
+as the swap that opened the gap (transactions already queued), so a bot that reacts to the stream earns about nothing.
+**Atomic DEX-to-DEX arbitrage is closed** (see `HANDOFF.md`, "Outcome").
+
+Exchange-vs-Base (2026-10-17..19): 43 contracts trade Base's WETH/USDC and cbBTC/USDC pools consistently ahead of
+Coinbase's price, ~$7.0k/day after gas, but the top 3 take 91% (one takes 75%) and the edge is ~0.5 bp of the $134M/day
+they trade, less than a Coinbase taker fee. Stopped by the rule set before measuring.
 
 ## Tests
 
-128 tests (`pytest -v tests/`) run against a local anvil fork of Base. They deploy trap tokens (honeypot, transfer tax,
+139 tests (`pytest -v tests/`) run against a local anvil fork of Base. They deploy trap tokens (honeypot, transfer tax,
 mutable tax, pause, blacklist, mint), check quotes against real swaps on every venue, and pin the known contract
 deployments so a protocol change fails loudly. Needs Foundry and internet; takes about 23 minutes.
 

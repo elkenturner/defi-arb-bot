@@ -350,6 +350,28 @@ each block as ~11 flashblocks (~200ms apart, index 0 = the system deposit) on `w
   txs already queued when the gap opened; reacting to the stream wins cents. Flashblock spacing median 166 ms.
 - Commands: `python flashblock_recorder.py --hours 6` · `--report` · `--timing logs/arb_history_fb.db`.
 
+## CEX-DEX markout (`cex_markout.py`): the exchange-vs-Base market
+Read-only, no API keys, no orders. Reuses `arb_history.py`'s ingested windows (its `swaps` and `pools` tables).
+- **Swaps:** every single-pool tx on a USDC vs WETH/native-ETH or cbBTC pool (233 pools across all venues incl. V4 and
+  unknown forks; pools seen only in single-pool txs are resolved into `logs/cex_markout.db`).
+- **Who:** the Swap event's `sender` (the contract that called the pool: a router for users, the bot's own contract
+  for bots), re-pulled for those pools only (arb_history doesn't keep it; V4's is stored). Up to 200 receipts per
+  sender are sampled for gas (L2 + `l1Fee`) and the EOAs behind it.
+- **Price:** Coinbase's public `/products/{ETH-USD,BTC-USD}/trades` (every trade, microsecond timestamps, paged by
+  trade id, checked for missing ids). **Candles stop at 60 s granularity: too coarse for +2/+12 s.** USDC = $1,
+  cbBTC = BTC-USD.
+- **Timing:** Base timestamps are exactly 2 s apart and mark the **end** of the block's build (flashblock 0 arrives
+  ~1.95 s before the timestamp, the last ~0.3 s before). A swap is placed at timestamp − 1 s (± 1 s), so +2 s is rough.
+- **Markout** (trader's gain) = −(pool's base delta × P(t+h) + pool's USDC delta) at h = 0/2/12/60 s, LP fee included,
+  Coinbase fees not. A sender is `cexdex` with ≥ 10 swaps, positive totals at +2/+12/+60 s and ≥ 55% won at +12 s;
+  `public` when ≥ half of its sampled txs come from distinct EOAs (routers, intent settlers, EOA-rotating bots).
+- **Decision rule (set before measuring, 2026-10-21): if the top 3 senders take most of it, stop.**
+- **Result (2026-10-17..19):** 412k txs, 446 senders, 43 `cexdex`: markout +12 s $14.6k/day − gas $7.6k = **$7.0k/day**,
+  **top 3 take 91%** (one sender `0x51c7…` 75%; with public/low-win positives included still 67–81%). Edge after gas
+  = **0.52 bp** of $134M/day notional, below any Coinbase taker fee. 23 of the 43 are also atomic-arb contracts but make
+  $176/day. → **stop.**
+- Commands: `python cex_markout.py` (fetch + report) · `--report` (stored data only).
+
 ## Tests
 `pytest -v tests/` starts its own anvil fork on port 8546, so it doesn't clash with a fork on 8545. It compiles
 `tests/contracts/src/Trap.sol` with forge and deploys fake tokens with $60k Aerodrome pools
@@ -387,11 +409,15 @@ each block as ~11 flashblocks (~200ms apart, index 0 = the system deposit) on `w
   found), attempt extraction + true-net math, public contracts (EntryPoint/router) not counted as bots.
 - `test_flashblock_recorder.py` (4): tx ranges per flashblock, untrusted blocks (mid-block join, missing index, skipped
   block), arb timing relative to the trigger, per-token buckets, flashblock arrival spacing.
+- `test_cex_markout.py` (9): target-pool pairing (native ETH = WETH), markout sign for buys and sells, swap timing,
+  last-trade price lookup, multi-swap txs and per-horizon prices (no price → not guessed), sender classification
+  (consistent / public / too few / not positive at every horizon), gas and hedge-cost math, break-even bp, the
+  decision rule, event sender topic, and a live Coinbase page (contiguous ids, sub-second times).
 - `test_slipstream.py` (7): discovery for both bases plus pool→factory linkage, quote == real swap, oversize quote →
   0, CL routes mixed with legacy pools, registry ↔ deployments tripwire, shared-tick-spacing quoter routing,
   next-block quote context. The quote==swap test pins the swap's timestamp to the quote's (dynamic fees decay with time).
 The test deployer gets USDC by minting through Circle's masterMinter (impersonated on the fork), **not** by swapping.
-Swapping $600k through the anchor moved its price and broke later tests. Takes about 23 minutes (130 tests). Needs Foundry and internet. **Add a test whenever a new trap type or route shape is handled.**
+Swapping $600k through the anchor moved its price and broke later tests. Takes about 23 minutes (139 tests). Needs Foundry and internet. **Add a test whenever a new trap type or route shape is handled.**
 
 ## Tech stack
 - **Python 3** + **web3.py**: scanning, quoting, simulation driver
@@ -435,5 +461,6 @@ plus `--priority-gwei` (default 0.001) instead, so fork and live gas estimates m
 - Tests: `pytest -v tests/`
 - Pipeline: `python pipeline.py [--loop] [--workers N] [--tokens 0x..,0x..] [--recheck]`
 - Arb market history: `python arb_history.py --hours 24 --rpc https://base.drpc.org`, then `--report`
+- CEX-DEX markout: `python cex_markout.py` · `--report`
 - Safety knobs: `--min-liquidity 50000` (per pool, USD), `--max-tax 0.5` (percent), `--priority-gwei 0.001`
 - Routing knobs: `--settle native|usdc`, `--gas-overhead 60000`, `--gas-per-swap 120000`, `--size-search`

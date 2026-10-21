@@ -301,6 +301,20 @@ land inside blocks. 1.65M swaps → 138,741 txs on 2+ pools → 41,849 loop-shap
   before its own failed attempts, which can cost as much as it earns. **Roughly −$15 to +$60/day, most likely near zero**,
   before any server or RPC cost. Not worth building as specified. Details in the session answer.
 
+**Exchange-vs-Base (CEX-DEX) market, 2026-10-21 (`cex_markout.py`, same 3 days, read-only, Coinbase public trades).**
+Decision rule fixed beforehand: stop if the top 3 senders take most of it.
+- 412,282 single-pool swaps on 233 WETH/USDC and cbBTC/USDC pools, marked out against 413k ETH-USD and 1.0M BTC-USD
+  Coinbase trades (no gaps). 1-minute candles would have been too coarse; the trade history is per-microsecond.
+- **43 contracts trade consistently ahead of Coinbase** (positive at +2, +12 and +60 s, ≥ 55% of swaps won):
+  markout $16.5k (+2 s) / $14.6k (+12 s) / $16.8k (+60 s) per day, gas $7.6k/day → **$7.0k/day net at +12 s**.
+- **Top 3 take 91%; `0x51c7…` alone 75%** ($5.3k/day on $69M/day traded). Counting borderline and "public" positive
+  senders too, the top 3 still take 67–81%.
+- The edge after gas is **0.52 bp** of the $134M/day they trade, less than a Coinbase taker fee (a 5 bp hedge cost makes
+  the whole group −$60k/day). Only market makers with near-zero exchange fees can do this.
+- **Overlap with atomic-arb bots:** 23 of the 43 are atomic-arb contracts (22 among the day-2 248), but together they
+  make only $176/day here. The big CEX-DEX traders are different contracts.
+- **Verdict: stop** (rule triggered: 91%).
+
 ## 7. Known gaps and limitations
 
 - **Uniswap V4: hookless pools at the 4 standard fee/tick pairs only.** Hooked pools (most V4 memecoin/Zora/Clanker
@@ -317,8 +331,8 @@ land inside blocks. 1.65M swaps → 138,741 txs on 2+ pools → 41,849 loop-shap
 
 ## 8. Open questions for Ken (good planning topics)
 
-0. **Atomic DEX-to-DEX arbitrage is closed** (see "Outcome" near the top). Next question under study: the
-   exchange-vs-Base market (Coinbase price vs Base pools), measured read-only.
+0. **Atomic DEX-to-DEX arbitrage is closed** (see "Outcome" near the top), and **exchange-vs-Base (CEX-DEX) is stopped**
+   too: one contract takes 75%, the top 3 91%, and the edge (0.5 bp) is below retail exchange fees. See §6.
 1. **Is there money here at all?** Decide what evidence would justify building the trading contract: e.g. "a
    fork-confirmed hit > $1 at least N times a week over two weeks of continuous scanning".
 2. **Which direction first?** (a) watch longer and gather statistics, (b) widen coverage (Uniswap V4, more/newer
