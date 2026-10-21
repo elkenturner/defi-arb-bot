@@ -344,7 +344,8 @@ each block as ~11 flashblocks (~200ms apart, index 0 = the system deposit) on `w
 - `--timing <arb_history db>` (run arb_history over the recorded window with `--to-block`): each arb's flashblock minus
   its trigger swap's. 0 = same flashblock (the bot was already queued: spam / priority), ≥1 = it reacted to the stream,
   which a new bot could do too. "block start" = gap open before the block.
-- **Result (2026-10-20, 3.1 h of trusted blocks, 3,073 arbs placed):** excluding one $2,039 ZORA arb, same flashblock
+- **Result (2026-10-20, 3.1 h of trusted blocks, 3,073 arbs placed):** 98% of profit in the trigger's flashblock
+  (incl. one $2,039 ZORA arb, also same flashblock). Excluding it, same flashblock
   $439 (avg $0.42/arb), +1 flashblock $37 (avg $0.02), +2 or more $1, open at block start $20. The money is taken by
   txs already queued when the gap opened; reacting to the stream wins cents. Flashblock spacing median 166 ms.
 - Commands: `python flashblock_recorder.py --hours 6` · `--report` · `--timing logs/arb_history_fb.db`.

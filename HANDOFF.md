@@ -47,6 +47,40 @@ seconds. The machinery works. Whether there's money in it is still unproven.
 
 ---
 
+## Outcome (2026-10-21): atomic DEX-to-DEX arbitrage on Base is closed
+
+**The question.** Can a bot earn money after all costs by buying a token in one Base pool and selling it in another,
+in one atomic transaction?
+
+**What was measured, and the key number from each** (all read-only or on a local fork; nothing was ever sent):
+| Measurement | Key number |
+|---|---|
+| Scanner, 30 seed tokens, two full scans (2026-10-16) | 0 profitable routes; best wstETH −$0.10, cbBTC −$0.12 per $500 |
+| Gap monitor, every block for 2 h (2026-10-17) | 7 of ~1.5M route-blocks above $0 (best +$0.01), none above $1. A 2 h watch after a sharp ETH move (2026-10-19): best $0.05 |
+| Size search, $100–$5k | the best size was always the smallest ($100): routes lose to fees, not to gas |
+| Uniswap V4 hookless pools | only cbBTC gains pools above the $50k floor; best $100 net −$0.02 |
+| Arb history, what real bots earned (3 days, 2026-10-17..19) | $4.0–5.0k/day for all bots (248–312 contracts); median arb ≈ $0.00; the 13 safe seed tokens $171–2,929/day (one cbBTC event) |
+| Unknown V4 pools (4,298) | the rough "≤ $14k/day" turned out to be $30–36/day |
+| Failed attempts (1 in 5 blocks, day 2) | ~10 txs per arb; arb-only bots net $2.7k/day after $1.2k/day of wasted gas |
+| Flashblock timing (3.1 h, 3,073 arbs) | 98% of profit ($2,478 incl. one $2,039 ZORA arb) landed in the same flashblock as the swap that opened the gap; one flashblock later: $37 (avg $0.02/arb); open at block start: $20 |
+
+**Verdict: stop.** The profit goes to transactions that were already queued when the gap opened, not to bots that see
+the gap and react. The leader (`0xe8c3…`) nets **~$1.37k/day**, the top 3 together $2.04k of the $2.73k/day true net,
+the next 7 another $0.82k, and **everyone below the top 10 loses money collectively (−$137/day; 83 of 162 bot contracts
+are net negative)**. A new bot reacting within one flashblock on the least concentrated tokens was estimated at
+−$15 to +$60/day, most likely about zero, before server and RPC costs.
+
+**What would have to change to revisit it:**
+- **Ordering rules.** A Base backrun auction or bundle service that places a paying tx right after a given trigger
+  would make reacting as good as being pre-queued.
+- **Cheaper failure.** If failed or reverted txs stopped costing gas (sequencer revert protection), or gas fell well
+  below ~$0.013 per attempt, pre-queuing/spamming becomes affordable for a newcomer.
+- **New venues with real volume** that the leaders don't cover yet (PancakeSwap V3, Balancer, Curve are not even
+  measured here).
+- **A different regime:** sustained dislocations (depegs, hacks, a new chain-wide token launch), or the leader leaving.
+- **How to check:** re-run `arb_history.py` (3+ days) and `flashblock_recorder.py --timing`. Revisit if reacting arbs
+  (one or more flashblocks after the trigger) on tokens that pass the safety gate exceed ~$200/day for a week.
+
 ## 2. Strategy and ground rules (agreed during the build)
 
 1. **Rules first, learning later.** The only decision rule: *trade if net profit after all costs > X* (default $1).
@@ -258,7 +292,8 @@ land inside blocks. 1.65M swaps → 138,741 txs on 2+ pools → 41,849 loop-shap
   true net** (≈ $0.013 per failed tx). A first pass said −$3.3k/day: it counted ERC-4337 EntryPoints and SwapRouter02
   (which once carried an arb) as bots and their users' trades as waste. Fixed and tested.
 - **React or pre-queued (Flashblocks):** of arbs placed in their flashblock (3,073, over 3.1 h of trusted blocks), the
-  profit sits in the **same flashblock as the swap that opened the gap: $439, avg $0.42/arb** (plus one $2,039 ZORA arb).
+  profit sits in the **same flashblock as the swap that opened the gap: $2,478 (98%)**; without one $2,039 ZORA arb
+  (also same flashblock, 3 txs behind its trigger) $439, avg $0.42/arb.
   Arbs one flashblock later: $37 (avg $0.02); two or more later: $1; gap already open at block start: $20. For XDP,
   STONKEX, CTR, fBOMB, SYND and DRV together: same flashblock $72, later $9, block start $1.
 - **Verdict on a new "react within 1 flashblock" bot** on the tokens where the top 3 take < 50% (XDP, STONKEX, fBOMB,
@@ -282,11 +317,8 @@ land inside blocks. 1.65M swaps → 138,741 txs on 2+ pools → 41,849 loop-shap
 
 ## 8. Open questions for Ken (good planning topics)
 
-0. **Arb history verdict (2026-10-20, three days + Flashblocks):** ~$4.5–4.9k/day is real but lumpy, the arb bots'
-   true net is ~$2.7k/day after failed attempts, and ~95% of the profit is won by txs already queued when the gap opens.
-   A bot that reacts to the stream would net about zero. Options: (a) stop atomic DEX-DEX arb, (b) study how the
-   same-flashblock winners get there (spam rate, priority, which tokens), knowing it's a gas war, (c) look at other
-   strategies (e.g. CEX-DEX, which shows up here as "mixed" contracts).
+0. **Atomic DEX-to-DEX arbitrage is closed** (see "Outcome" near the top). Next question under study: the
+   exchange-vs-Base market (Coinbase price vs Base pools), measured read-only.
 1. **Is there money here at all?** Decide what evidence would justify building the trading contract: e.g. "a
    fork-confirmed hit > $1 at least N times a week over two weeks of continuous scanning".
 2. **Which direction first?** (a) watch longer and gather statistics, (b) widen coverage (Uniswap V4, more/newer
